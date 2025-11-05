@@ -39,7 +39,7 @@ class PDFService:
             )
         
         self.converter = DocumentConverter(
-            pipeline_options=pipeline_options
+            # pipeline_options=pipeline_options
         )
         logger.info("PDFService initialized with docling converter")
     
