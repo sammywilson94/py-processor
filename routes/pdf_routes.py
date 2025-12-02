@@ -4,7 +4,7 @@ import logging
 import os
 import subprocess
 import uuid
-from flask import Blueprint, request, current_app
+from flask import Blueprint, request, current_app, Response
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import RequestEntityTooLarge
 
@@ -225,6 +225,16 @@ def get_stored_chunks():
             status_code=500
         )
     
+
+@pdf_bp.route('/clone-and-generate', methods=['OPTIONS'])
+def clone_and_generate_options():
+    """Handle CORS preflight requests for clone-and-generate endpoint."""
+    response = Response()
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With')
+    response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+    return response
+
 
 @pdf_bp.route('/clone-and-generate', methods=['POST'])
 def clone_and_generate():

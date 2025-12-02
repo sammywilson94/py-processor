@@ -45,8 +45,14 @@ def create_app() -> Flask:
     # Enable CORS for NestJS communication
     try:
         from flask_cors import CORS
-        CORS(app)
-        logger.info("CORS enabled")
+        # Configure CORS to allow all origins, methods, and headers for development
+        # Using simpler configuration that's more reliable for preflight requests
+        CORS(app, 
+             origins="*",
+             methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+             allow_headers=["Content-Type", "Authorization", "X-Requested-With", "Accept"],
+             supports_credentials=False)
+        logger.info("CORS enabled with full access for all origins")
     except ImportError:
         logger.warning("flask-cors not installed, CORS disabled")
     
