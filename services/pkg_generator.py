@@ -14,7 +14,7 @@ from code_parser.multi_normalizer import extract_definitions
 from code_parser.endpoint_extractors import extract_endpoints
 from code_parser.relationship_extractor import extract_relationships, calculate_fan_in_fan_out
 from utils.file_utils import collect_files
-
+import db.neo4j_db as neo4j_database  # Import to ensure connection is established
 
 class PKGGenerator:
     """Generate Project Knowledge Graph JSON."""
@@ -413,5 +413,7 @@ class PKGGenerator:
             with open(output_path, 'w', encoding='utf-8') as f:
                 json.dump(pkg, f, indent=2)
         
-        return pkg
+        neo4j_database.store_pkg(pkg)
+
+        return pkg        
 
