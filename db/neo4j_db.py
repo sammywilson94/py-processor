@@ -118,7 +118,6 @@ def get_session():
     
     if driver is None:
         raise ConnectionError("Neo4j driver not initialized. Check connection settings.")
-    
     session = driver.session(database=database)
     try:
         yield session
@@ -209,8 +208,8 @@ def _store_modules_tx(tx: Transaction, modules: List[Dict[str, Any]], project_id
         UNWIND $modules AS module
         MERGE (mod:Module {id: module.id})
         SET mod += module.data
-        WITH mod, module.projectId
-        MATCH (proj:Project {id: module.projectId})
+        WITH mod, module.projectId AS projectId, module
+        MATCH (proj:Project {id: projectId})
         MERGE (proj)-[:HAS_MODULE]->(mod)
     """, {"modules": module_data})
 
@@ -249,11 +248,10 @@ def _store_symbols_tx(tx: Transaction, symbols: List[Dict[str, Any]], project_id
         MERGE (sym:Symbol {id: symbol.id})
         SET sym.name = symbol.name,
             sym += symbol.data
-        WITH sym, symbol.projectId
-        MATCH (proj:Project {id: symbol.projectId})
+        WITH sym, symbol.projectId AS projectId
+        MATCH (proj:Project {id: projectId})
         MERGE (proj)-[:HAS_SYMBOL]->(sym)
     """, {"symbols": symbol_data})
-
 
 def _store_endpoints_tx(tx: Transaction, endpoints: List[Dict[str, Any]], project_id: str) -> None:
     """Transaction function to store endpoints using UNWIND batch operation."""
@@ -290,8 +288,8 @@ def _store_endpoints_tx(tx: Transaction, endpoints: List[Dict[str, Any]], projec
         MERGE (end:Endpoint {id: endpoint.id})
         SET end.path = endpoint.path,
             end += endpoint.data
-        WITH end, endpoint.projectId
-        MATCH (proj:Project {id: endpoint.projectId})
+        WITH end, endpoint.projectId AS projectId
+        MATCH (proj:Project {id: projectId})
         MERGE (proj)-[:HAS_ENDPOINT]->(end)
     """, {"endpoints": endpoint_data})
 
@@ -370,8 +368,8 @@ def _store_features_tx(tx: Transaction, features: List[Dict[str, Any]], project_
         MERGE (f:Feature {id: feature.feature_id})
         SET f.name = feature.name,
             f.path = feature.path
-        WITH f, feature.projectId
-        MATCH (proj:Project {id: feature.projectId})
+        WITH f, feature.projectId AS projectId
+        MATCH (proj:Project {id: projectId})
         MERGE (proj)-[:HAS_FEATURE]->(f)
     """, {"features": feature_data})
     
@@ -413,8 +411,8 @@ def store_pkg(pkg: Dict[str, Any]) -> bool:
     try:
         with get_session() as session:
             # Use write_transaction for atomic operations
-            session.write_transaction(_store_package_tx, pkg)
-            session.write_transaction(_store_project_tx, pkg)
+            session.execute_write(_store_package_tx, pkg)
+            session.execute_write(_store_project_tx, pkg)
             
             # Batch store modules
             modules = pkg.get("modules", [])
@@ -422,33 +420,33 @@ def store_pkg(pkg: Dict[str, Any]) -> bool:
                 # Process in batches if needed
                 for i in range(0, len(modules), batch_size):
                     batch = modules[i:i + batch_size]
-                    session.write_transaction(_store_modules_tx, batch, pkg["project"]["id"])
+                    session.execute_write(_store_modules_tx, batch, pkg["project"]["id"])
             
             # Batch store symbols
             symbols = pkg.get("symbols", [])
             if symbols:
                 for i in range(0, len(symbols), batch_size):
                     batch = symbols[i:i + batch_size]
-                    session.write_transaction(_store_symbols_tx, batch, pkg["project"]["id"])
+                    session.execute_write(_store_symbols_tx, batch, pkg["project"]["id"])
             
             # Batch store endpoints
             endpoints = pkg.get("endpoints", [])
             if endpoints:
                 for i in range(0, len(endpoints), batch_size):
                     batch = endpoints[i:i + batch_size]
-                    session.write_transaction(_store_endpoints_tx, batch, pkg["project"]["id"])
+                    session.execute_write(_store_endpoints_tx, batch, pkg["project"]["id"])
             
             # Batch store edges
             edges = pkg.get("edges", [])
             if edges:
                 for i in range(0, len(edges), batch_size):
                     batch = edges[i:i + batch_size]
-                    session.write_transaction(_store_edges_tx, batch)
+                    session.execute_write(_store_edges_tx, batch)
             
             # Batch store features
             features = pkg.get("features", [])
             if features:
-                session.write_transaction(_store_features_tx, features, pkg["project"]["id"])
+                session.execute_write(_store_features_tx, features, pkg["project"]["id"])
             
             logger.info(f"Successfully stored PKG for project: {pkg['project'].get('id', 'unknown')}")
             return True
