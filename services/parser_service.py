@@ -94,8 +94,10 @@ def generate_pkg(
         output_path = os.path.join(repo_path, 'pkg.json')
     
     # Check cache if enabled
+    logger.info(f"📦 CHECKING PKG CACHE | Repo: {repo_path} | Cache enabled: {use_cache}")
     if use_cache and os.path.exists(output_path):
         try:
+            logger.debug(f"📄 CACHE FILE EXISTS | Path: {output_path} | Reading...")
             with open(output_path, 'r', encoding='utf-8') as f:
                 cached_pkg = json.load(f)
             
@@ -105,21 +107,21 @@ def generate_pkg(
             
             if cached_sha is not None and current_sha is not None:
                 if cached_sha == current_sha:
-                    logger.info(f"Using cached PKG for {repo_path} (git SHA: {current_sha[:8]}...)")
+                    logger.info(f"✅ USING CACHED PKG | Repo: {repo_path} | Git SHA: {current_sha[:8]}... | Modules: {len(cached_pkg.get('modules', []))}")
                     return cached_pkg
                 else:
-                    logger.info(f"Cache invalidated: git SHA changed ({cached_sha[:8]}... -> {current_sha[:8]}...)")
+                    logger.info(f"🔄 CACHE INVALIDATED | Repo: {repo_path} | SHA changed: {cached_sha[:8]}... -> {current_sha[:8]}... | Regenerating...")
             elif cached_sha is None and current_sha is None:
                 # Both are None (not a git repo), check if file is recent enough
                 # For now, we'll regenerate if SHA is None to be safe
-                logger.info("No git SHA available, regenerating PKG")
+                logger.info(f"ℹ️  NO GIT SHA | Repo: {repo_path} | Regenerating PKG")
             else:
-                logger.info("Git SHA mismatch, regenerating PKG")
+                logger.info(f"🔄 GIT SHA MISMATCH | Repo: {repo_path} | Regenerating PKG")
         except Exception as e:
-            logger.warning(f"Error reading cached PKG: {e}, regenerating...")
+            logger.warning(f"⚠️  CACHE READ ERROR | Repo: {repo_path} | Error: {e} | Regenerating...")
     
     # Generate new PKG
-    logger.info(f"Generating PKG for {repo_path}")
+    logger.info(f"🏗️  GENERATING PKG | Repo: {repo_path} | Fan threshold: {fan_threshold} | Include features: {include_features}")
     generator = PKGGenerator(
         repo_path=repo_path,
         fan_threshold=fan_threshold,
@@ -127,6 +129,6 @@ def generate_pkg(
     )
     
     pkg = generator.generate_pkg(output_path=output_path)
-    logger.info(f"PKG generated and saved to {output_path}")
+    logger.info(f"✅ PKG GENERATED | Repo: {repo_path} | Saved to: {output_path} | Modules: {len(pkg.get('modules', []))} | Symbols: {len(pkg.get('symbols', []))} | Edges: {len(pkg.get('edges', []))}")
     
     return pkg

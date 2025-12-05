@@ -5,10 +5,12 @@ import os
 import subprocess
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, Any, Optional
 from flask_socketio import SocketIO
 
 from services.parser_service import generate_pkg
+import db.neo4j_db as neo4j_db
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,8 @@ class AgentOrchestrator:
             sid: Socket session ID
         """
         try:
+            logger.info(f"🔄 PROCESSING USER REQUEST | Session: {session_id} | Message: '{user_message[:50]}...' | Repo URL: {repo_url or 'None'}")
+            
             # Stream initial status
             self._stream_update(
                 socketio, sid, "status", "intent_extraction",
@@ -52,23 +56,32 @@ class AgentOrchestrator:
                 session_id
             )
             
+            # Retrieve repo_url from session if not provided
+            if not repo_url and session_id in self.sessions:
+                repo_url = self.sessions[session_id].get('repo_url')
+                logger.info(f"📋 RETRIEVED REPO URL FROM SESSION | Session: {session_id} | URL: {repo_url}")
+            
             # Ensure repo is loaded if URL provided
             repo_path = None
             pkg_data = None
             
             if repo_url:
+                logger.info(f"📥 LOADING REPOSITORY | Session: {session_id} | URL: {repo_url}")
                 repo_path, pkg_data = self._ensure_repo_loaded(
                     session_id, repo_url, socketio, sid
                 )
-                if not repo_path:
+                if not pkg_data:
+                    logger.error(f"❌ FAILED TO LOAD REPO/PKG | Session: {session_id} | URL: {repo_url}")
                     self._stream_update(
                         socketio, sid, "error", "repo_loading",
-                        {"message": "Failed to load repository"},
+                        {"message": "Failed to load repository or PKG data"},
                         session_id
                     )
                     return
+                logger.info(f"✅ REPOSITORY LOADED | Session: {session_id} | Path: {repo_path} | PKG loaded: {pkg_data is not None}")
             
             # Extract intent
+            logger.info(f"🧠 EXTRACTING INTENT | Session: {session_id} | Analyzing user message...")
             self._stream_update(
                 socketio, sid, "status", "intent_extraction",
                 {"message": "Analyzing your request..."},
@@ -79,6 +92,10 @@ class AgentOrchestrator:
                 from agents.intent_router import IntentRouter
                 intent_router = IntentRouter()
                 intent = intent_router.extract_intent(user_message)
+                
+                intent_category = intent.get('intent_category', 'unknown')
+                intent_type = intent.get('intent', 'unknown')
+                logger.info(f"✅ INTENT EXTRACTED | Session: {session_id} | Category: {intent_category} | Type: {intent_type}")
                 
                 self._stream_update(
                     socketio, sid, "log", "intent_extraction",
@@ -103,22 +120,33 @@ class AgentOrchestrator:
             
             # Route based on intent category
             intent_category = intent.get('intent_category', 'code_change')
+            logger.info(f"🎯 ROUTING BY INTENT | Session: {session_id} | Category: {intent_category}")
             
             if intent_category == 'informational_query':
+                logger.info(f"❓ HANDLING INFORMATIONAL QUERY | Session: {session_id}")
                 # Handle informational queries - may need PKG but not repo_path
-                if not pkg_data and repo_url:
-                    # Try to load PKG if repo_url provided
+                # Retrieve repo_url from session if not provided
+                if not repo_url and session_id in self.sessions:
+                    repo_url = self.sessions[session_id].get('repo_url')
+                
+                if not pkg_data:
+                    # Try to load PKG (will check session cache, Neo4j, file cache, or regenerate)
                     repo_path, pkg_data = self._ensure_repo_loaded(
                         session_id, repo_url, socketio, sid
                     )
                     if pkg_data:
                         self.sessions[session_id]['pkg_data'] = pkg_data
+                        if repo_path:
+                            self.sessions[session_id]['repo_path'] = repo_path
                 
                 if pkg_data:
+                    logger.info(f"💬 PROCESSING QUERY | Session: {session_id} | Query: '{user_message[:50]}...'")
                     self._handle_informational_query(
                         user_message, intent, pkg_data, session_id, socketio, sid
                     )
+                    logger.info(f"✅ QUERY RESPONSE SENT | Session: {session_id}")
                 else:
+                    logger.warning(f"⚠️  NO PKG DATA FOR QUERY | Session: {session_id} | Requesting repo URL")
                     self._stream_update(
                         socketio, sid, "error", "query_handling",
                         {"message": "PKG data is required to answer queries. Please provide a repository URL."},
@@ -127,14 +155,21 @@ class AgentOrchestrator:
                 return
             
             elif intent_category == 'diagram_request':
+                logger.info(f"📊 HANDLING DIAGRAM REQUEST | Session: {session_id}")
                 # Handle diagram requests - may need PKG but not repo_path
-                if not pkg_data and repo_url:
-                    # Try to load PKG if repo_url provided
+                # Retrieve repo_url from session if not provided
+                if not repo_url and session_id in self.sessions:
+                    repo_url = self.sessions[session_id].get('repo_url')
+                
+                if not pkg_data:
+                    # Try to load PKG (will check session cache, Neo4j, file cache, or regenerate)
                     repo_path, pkg_data = self._ensure_repo_loaded(
                         session_id, repo_url, socketio, sid
                     )
                     if pkg_data:
                         self.sessions[session_id]['pkg_data'] = pkg_data
+                        if repo_path:
+                            self.sessions[session_id]['repo_path'] = repo_path
                 
                 if pkg_data:
                     self._handle_diagram_request(
@@ -150,11 +185,15 @@ class AgentOrchestrator:
             
             elif intent_category == 'code_change':
                 # Execute full workflow for code changes
+                logger.info(f"⚙️  HANDLING CODE CHANGE REQUEST | Session: {session_id}")
                 if repo_path and pkg_data:
+                    logger.info(f"🚀 EXECUTING WORKFLOW | Session: {session_id} | Repo: {repo_path}")
                     self._execute_workflow(
                         intent, pkg_data, repo_path, session_id, socketio, sid
                     )
+                    logger.info(f"✅ WORKFLOW COMPLETED | Session: {session_id}")
                 else:
+                    logger.warning(f"⚠️  MISSING REPO/PKG FOR CODE CHANGE | Session: {session_id}")
                     self._stream_update(
                         socketio, sid, "status", "waiting",
                         {"message": "Please provide a repository URL to proceed with code changes"},
@@ -185,75 +224,156 @@ class AgentOrchestrator:
     def _ensure_repo_loaded(
         self,
         session_id: str,
-        repo_url: str,
-        socketio: SocketIO,
-        sid: str
+        repo_url: Optional[str] = None,
+        socketio: Optional[SocketIO] = None,
+        sid: Optional[str] = None
     ) -> tuple:
         """
         Ensure repository is cloned and PKG is loaded.
+        
+        Args:
+            session_id: Session identifier
+            repo_url: Optional repository URL (if None, uses session's repo_url)
+            socketio: Optional SocketIO instance for streaming updates
+            sid: Optional socket session ID
         
         Returns:
             Tuple of (repo_path, pkg_data) or (None, None) on failure
         """
         try:
-            # Check if already loaded in session
-            if session_id in self.sessions:
-                session = self.sessions[session_id]
-                if session.get('repo_url') == repo_url and session.get('pkg_data'):
-                    logger.info(f"Using cached PKG for session {session_id}")
-                    return session.get('repo_path'), session.get('pkg_data')
+            logger.info(f"📦 ENSURING REPO LOADED | Session: {session_id} | URL: {repo_url or 'from session'}")
             
-            self._stream_update(
-                socketio, sid, "status", "repo_loading",
-                {"message": f"Loading repository: {repo_url}"},
-                session_id
-            )
+            # Get session
+            session = self.sessions.get(session_id, {})
+            
+            # If repo_url not provided, try to get from session
+            if not repo_url:
+                repo_url = session.get('repo_url')
+                if not repo_url:
+                    logger.warning(f"⚠️  NO REPO URL | Session: {session_id} | No repo_url provided and none found in session")
+                    return None, None
+                logger.info(f"📋 USING SESSION REPO URL | Session: {session_id} | URL: {repo_url}")
+            
+            # Check if already loaded in session cache
+            if session.get('repo_url') == repo_url and session.get('pkg_data'):
+                logger.info(f"✅ USING CACHED PKG | Session: {session_id} | Repo: {repo_url}")
+                return session.get('repo_path'), session.get('pkg_data')
+            
+            # Extract project_id from repo_url (before cloning)
+            # Use same logic as extract_project_metadata: repo_name from URL
+            project_id = os.path.splitext(os.path.basename(repo_url))[0]
+            logger.info(f"🔍 PROJECT ID EXTRACTED | Session: {session_id} | Project ID: {project_id}")
+            
+            # Try to load from Neo4j first (before cloning)
+            logger.info(f"🔎 CHECKING NEO4J FOR PKG | Session: {session_id} | Project ID: {project_id}")
+            if neo4j_db.check_pkg_stored(project_id):
+                logger.info(f"✅ PKG FOUND IN NEO4J | Session: {session_id} | Project ID: {project_id} | Loading from database...")
+                if socketio and sid:
+                    self._stream_update(
+                        socketio, sid, "status", "pkg_loading",
+                        {"message": "Loading knowledge graph from database..."},
+                        session_id
+                    )
+                
+                pkg_data = neo4j_db.load_pkg_from_neo4j(project_id)
+                if pkg_data:
+                    logger.info(f"✅ PKG LOADED FROM NEO4J | Session: {session_id} | Project ID: {project_id} | Modules: {len(pkg_data.get('modules', []))} | Symbols: {len(pkg_data.get('symbols', []))}")
+                    # We have PKG from Neo4j, but we may still need repo_path
+                    # Try to get from session or construct from project rootPath
+                    repo_path = session.get('repo_path')
+                    if not repo_path and pkg_data.get('project', {}).get('rootPath'):
+                        repo_path = pkg_data['project']['rootPath']
+                    
+                    # Store in session
+                    if session_id not in self.sessions:
+                        self.sessions[session_id] = {}
+                    self.sessions[session_id]['repo_url'] = repo_url
+                    self.sessions[session_id]['repo_path'] = repo_path
+                    self.sessions[session_id]['pkg_data'] = pkg_data
+                    
+                    if socketio and sid:
+                        self._stream_update(
+                            socketio, sid, "status", "pkg_loading",
+                            {"message": "Knowledge graph loaded from database successfully"},
+                            session_id
+                        )
+                    
+                    return repo_path, pkg_data
+                else:
+                    logger.warning(f"⚠️  FAILED TO LOAD PKG FROM NEO4J | Session: {session_id} | Project ID: {project_id}")
+            else:
+                logger.info(f"ℹ️  PKG NOT IN NEO4J | Session: {session_id} | Project ID: {project_id} | Will clone and generate")
+            
+            # If not in Neo4j, proceed with cloning and file cache/regeneration
+            logger.info(f"📥 CLONING REPOSITORY | Session: {session_id} | URL: {repo_url}")
+            if socketio and sid:
+                self._stream_update(
+                    socketio, sid, "status", "repo_loading",
+                    {"message": f"Loading repository: {repo_url}"},
+                    session_id
+                )
             
             # Ensure cloned_repos folder exists
             base_dir = os.path.join(os.getcwd(), "cloned_repos")
             os.makedirs(base_dir, exist_ok=True)
+            logger.debug(f"📁 CLONED REPOS DIR | Session: {session_id} | Path: {base_dir}")
             
             # Extract repo name from URL
             repo_name = os.path.splitext(os.path.basename(repo_url))[0]
             folder_path = os.path.join(base_dir, repo_name)
+            logger.info(f"📂 REPO PATH | Session: {session_id} | Repo name: {repo_name} | Full path: {folder_path}")
             
             # Clone repo if not exists
             if not os.path.exists(folder_path):
-                self._stream_update(
-                    socketio, sid, "log", "repo_loading",
-                    {"message": f"Cloning repository..."},
-                    session_id
-                )
+                logger.info(f"🔄 CLONING REPO | Session: {session_id} | URL: {repo_url} | Target: {folder_path}")
+                if socketio and sid:
+                    self._stream_update(
+                        socketio, sid, "log", "repo_loading",
+                        {"message": f"Cloning repository..."},
+                        session_id
+                    )
                 
                 try:
                     git_cmd = "git"
                     try:
                         subprocess.run([git_cmd, "--version"], check=True, capture_output=True)
+                        logger.debug(f"✅ GIT FOUND | Session: {session_id} | Using: {git_cmd}")
                     except (FileNotFoundError, subprocess.CalledProcessError):
                         git_cmd = r"C:\Program Files\Git\cmd\git.exe"
+                        logger.debug(f"✅ GIT FOUND (Windows) | Session: {session_id} | Using: {git_cmd}")
                     
+                    logger.info(f"⏳ CLONING IN PROGRESS | Session: {session_id} | This may take a while...")
                     subprocess.run([git_cmd, "clone", repo_url, folder_path], check=True)
-                    logger.info(f"Repository cloned successfully into {folder_path}")
+                    logger.info(f"✅ REPOSITORY CLONED | Session: {session_id} | Path: {folder_path}")
                 except FileNotFoundError:
-                    logger.exception("Git executable not found")
+                    logger.error(f"❌ GIT NOT FOUND | Session: {session_id} | Git executable not found")
                     return None, None
                 except subprocess.CalledProcessError as e:
-                    logger.exception("Failed to clone repository")
+                    logger.error(f"❌ CLONE FAILED | Session: {session_id} | Error: {e}")
                     return None, None
             else:
-                logger.info(f"Repository already exists at {folder_path}")
+                logger.info(f"✅ REPO ALREADY EXISTS | Session: {session_id} | Path: {folder_path} | Skipping clone")
             
-            # Load PKG
-            self._stream_update(
-                socketio, sid, "status", "pkg_generation",
-                {"message": "Generating knowledge graph..."},
-                session_id
-            )
+            # Update project_id from actual repo path (same as extract_project_metadata)
+            project_id = Path(folder_path).name
+            logger.info(f"🆔 PROJECT ID | Session: {session_id} | Project ID: {project_id}")
             
-            pkg_data = self._load_pkg(folder_path)
+            # Load PKG (will try file cache, then regenerate)
+            logger.info(f"📊 GENERATING PKG | Session: {session_id} | Project ID: {project_id} | Repo path: {folder_path}")
+            if socketio and sid:
+                self._stream_update(
+                    socketio, sid, "status", "pkg_generation",
+                    {"message": "Generating knowledge graph..."},
+                    session_id
+                )
+            
+            pkg_data = self._load_pkg(folder_path, project_id)
             
             if not pkg_data:
+                logger.error(f"❌ PKG GENERATION FAILED | Session: {session_id} | Project ID: {project_id}")
                 return None, None
+            
+            logger.info(f"✅ PKG GENERATED | Session: {session_id} | Project ID: {project_id} | Modules: {len(pkg_data.get('modules', []))} | Symbols: {len(pkg_data.get('symbols', []))} | Edges: {len(pkg_data.get('edges', []))}")
             
             # Store in session
             if session_id not in self.sessions:
@@ -262,11 +382,12 @@ class AgentOrchestrator:
             self.sessions[session_id]['repo_path'] = folder_path
             self.sessions[session_id]['pkg_data'] = pkg_data
             
-            self._stream_update(
-                socketio, sid, "status", "pkg_generation",
-                {"message": "Knowledge graph generated successfully"},
-                session_id
-            )
+            if socketio and sid:
+                self._stream_update(
+                    socketio, sid, "status", "pkg_generation",
+                    {"message": "Knowledge graph generated successfully"},
+                    session_id
+                )
             
             return folder_path, pkg_data
         
@@ -274,24 +395,59 @@ class AgentOrchestrator:
             logger.error(f"Error loading repo: {e}", exc_info=True)
             return None, None
     
-    def _load_pkg(self, repo_path: str) -> Optional[Dict[str, Any]]:
+    def _load_pkg(self, repo_path: Optional[str] = None, project_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
-        Load PKG from repository path.
+        Load PKG with priority: session cache → Neo4j → file cache → regenerate.
         
         Args:
-            repo_path: Path to repository
+            repo_path: Optional path to repository (for file cache/regeneration)
+            project_id: Optional project ID (for Neo4j loading)
             
         Returns:
             PKG data dictionary or None on failure
         """
         try:
-            pkg_data = generate_pkg(
-                repo_path=repo_path,
-                fan_threshold=3,
-                include_features=True,
-                use_cache=True
-            )
-            return pkg_data
+            # Priority 1: Session cache (handled in _ensure_repo_loaded, but check here too)
+            # This is mainly for direct calls to _load_pkg
+            
+            # Priority 2: Neo4j (if project_id provided)
+            if project_id and neo4j_db.check_pkg_stored(project_id):
+                logger.info(f"Loading PKG from Neo4j for project {project_id}")
+                pkg_data = neo4j_db.load_pkg_from_neo4j(project_id)
+                if pkg_data:
+                    return pkg_data
+                else:
+                    logger.warning(f"Failed to load PKG from Neo4j for project {project_id}, falling back to file cache")
+            
+            # Priority 3: File cache (if repo_path provided)
+            if repo_path:
+                logger.info(f"Loading PKG from file cache for {repo_path}")
+                try:
+                    pkg_data = generate_pkg(
+                        repo_path=repo_path,
+                        fan_threshold=3,
+                        include_features=True,
+                        use_cache=True
+                    )
+                    if pkg_data:
+                        return pkg_data
+                except Exception as e:
+                    logger.warning(f"Error loading PKG from file cache: {e}, will regenerate")
+            
+            # Priority 4: Regenerate (if repo_path provided)
+            if repo_path:
+                logger.info(f"Regenerating PKG for {repo_path}")
+                pkg_data = generate_pkg(
+                    repo_path=repo_path,
+                    fan_threshold=3,
+                    include_features=True,
+                    use_cache=False
+                )
+                return pkg_data
+            
+            logger.error("Cannot load PKG: no repo_path or project_id provided")
+            return None
+            
         except Exception as e:
             logger.error(f"Error loading PKG: {e}", exc_info=True)
             return None
@@ -717,6 +873,7 @@ class AgentOrchestrator:
             sid: Socket session ID
         """
         try:
+            logger.info(f"💬 PROCESSING QUERY | Session: {session_id} | Query: '{user_message[:100]}...'")
             self._stream_update(
                 socketio, sid, "status", "query_handling",
                 {"message": "Processing your question..."},
@@ -726,10 +883,16 @@ class AgentOrchestrator:
             from agents.query_handler import QueryHandler
             from services.pkg_query_engine import PKGQueryEngine
             
+            logger.info(f"🔍 INITIALIZING QUERY ENGINE | Session: {session_id}")
             query_engine = PKGQueryEngine(pkg_data)
             query_handler = QueryHandler(pkg_data, query_engine)
             
+            logger.info(f"🤖 GENERATING ANSWER | Session: {session_id} | Using query handler...")
             result = query_handler.answer_query(user_message, intent)
+            
+            answer_length = len(result.get('answer', ''))
+            ref_count = len(result.get('references', []))
+            logger.info(f"✅ ANSWER GENERATED | Session: {session_id} | Answer length: {answer_length} chars | References: {ref_count}")
             
             self._stream_update(
                 socketio, sid, "query_response", "query_handling",
@@ -740,9 +903,10 @@ class AgentOrchestrator:
                 },
                 session_id
             )
+            logger.info(f"📤 QUERY RESPONSE SENT | Session: {session_id}")
             
         except Exception as e:
-            logger.error(f"Error handling informational query: {e}", exc_info=True)
+            logger.error(f"❌ QUERY HANDLING ERROR | Session: {session_id} | Error: {e}", exc_info=True)
             self._stream_update(
                 socketio, sid, "error", "query_handling",
                 {"message": f"Failed to process query: {str(e)}"},

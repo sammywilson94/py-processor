@@ -67,10 +67,14 @@ def register_chat_events(socketio):
     
     
     @socketio.on('disconnect')
-    def handle_disconnect():
+    def handle_disconnect(*args, **kwargs):
         """Handle client WebSocket disconnection."""
         try:
-            sid = request.sid
+            sid = request.sid if hasattr(request, 'sid') else None
+            
+            if not sid:
+                logger.warning("WebSocket disconnect called but no SID available")
+                return
             
             # Find and remove session by SID
             session_to_remove = None
@@ -136,12 +140,15 @@ def register_chat_events(socketio):
                         'sid': sid
                     }
             
-            logger.info(f"Chat message received - Session: {session_id}, Message length: {len(message)}")
+            logger.info(f"📨 USER MESSAGE RECEIVED | Session: {session_id} | Message: {message[:100]}... | Length: {len(message)} chars")
             
             # Store repo_url and session info
             if repo_url:
+                logger.info(f"🔗 REPO URL PROVIDED | Session: {session_id} | URL: {repo_url}")
                 active_sessions[session_id]['repo_url'] = repo_url
                 active_sessions[session_id]['repo_path'] = None  # Will be set when PKG is loaded
+            else:
+                logger.info(f"ℹ️  NO REPO URL | Session: {session_id} | Using existing session data if available")
             
             # Emit acknowledgment
             emit('agent_update', {
@@ -157,6 +164,7 @@ def register_chat_events(socketio):
             
             # Integrate with agent orchestrator
             try:
+                logger.info(f"🚀 STARTING AGENT PROCESSING | Session: {session_id} | Processing user request...")
                 from services.agent_orchestrator import AgentOrchestrator
                 orchestrator = AgentOrchestrator()
                 orchestrator.process_user_request(
@@ -166,6 +174,7 @@ def register_chat_events(socketio):
                     socketio=socketio,
                     sid=sid
                 )
+                logger.info(f"✅ AGENT PROCESSING COMPLETED | Session: {session_id}")
             except ImportError as e:
                 logger.error(f"Failed to import agent orchestrator: {e}", exc_info=True)
                 emit('error', {
@@ -304,12 +313,20 @@ def register_chat_events(socketio):
     @socketio.on_error_default
     def default_error_handler(e):
         """Default error handler for unhandled WebSocket errors."""
-        logger.error(f"Unhandled WebSocket error: {e}", exc_info=True)
-        emit('error', {
-            'type': 'unhandled_error',
-            'message': f'An unexpected error occurred: {str(e)}',
-            'timestamp': datetime.utcnow().isoformat()
-        })
+        try:
+            logger.error(f"Unhandled WebSocket error: {e}", exc_info=True)
+            sid = request.sid if hasattr(request, 'sid') else None
+            if sid:
+                try:
+                    emit('error', {
+                        'type': 'unhandled_error',
+                        'message': f'An unexpected error occurred: {str(e)}',
+                        'timestamp': datetime.utcnow().isoformat()
+                    })
+                except Exception as emit_error:
+                    logger.error(f"Failed to emit error to client {sid}: {emit_error}")
+        except Exception as handler_error:
+            logger.error(f"Error in default error handler: {handler_error}", exc_info=True)
     
     
     logger.info("Chat event handlers registered successfully")

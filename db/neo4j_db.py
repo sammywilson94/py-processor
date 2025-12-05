@@ -73,6 +73,7 @@ def _create_indexes(driver_instance: GraphDatabase.driver) -> None:
             session.run("CREATE INDEX IF NOT EXISTS FOR (e:Endpoint) ON (e.id)")
             session.run("CREATE INDEX IF NOT EXISTS FOR (f:Feature) ON (f.id)")
             session.run("CREATE INDEX IF NOT EXISTS FOR (pkg:Package) ON (pkg.id)")
+            session.run("CREATE INDEX IF NOT EXISTS FOR (d:Document) ON (d.url)")
             
             logger.info("Neo4j indexes created/verified")
     except Exception as e:
@@ -89,17 +90,20 @@ def verify_connection() -> bool:
     global driver
     
     if driver is None:
+        logger.debug("Neo4j driver not initialized, attempting initialization...")
         driver = _initialize_driver()
     
     if driver is None:
+        logger.warning("Neo4j driver initialization failed. Check NEO4J_URI, NEO4J_USER, and NEO4J_PASSWORD environment variables.")
         return False
     
     try:
         driver.verify_connectivity()
+        logger.debug("Neo4j connection verified successfully")
         return True
     except Exception as e:
         logger.error(f"Neo4j connection verification failed: {e}")
-        driver = None
+        driver = None  # Reset driver to force re-initialization
         return False
 
 
@@ -208,7 +212,7 @@ def _store_modules_tx(tx: Transaction, modules: List[Dict[str, Any]], project_id
         UNWIND $modules AS module
         MERGE (mod:Module {id: module.id})
         SET mod += module.data
-        WITH mod, module.projectId AS projectId, module
+        WITH mod, module.projectId AS projectId
         MATCH (proj:Project {id: projectId})
         MERGE (proj)-[:HAS_MODULE]->(mod)
     """, {"modules": module_data})
@@ -404,55 +408,88 @@ def store_pkg(pkg: Dict[str, Any]) -> bool:
     Returns:
         True if successful, False otherwise
     """
+    project_id = pkg.get('project', {}).get('id', 'unknown')
+    
+    logger.info(f"💾 STORING PKG TO NEO4J | Project ID: {project_id}")
+    
     if not verify_connection():
-        logger.error("Cannot store PKG: Neo4j connection not available")
+        logger.error(f"❌ NEO4J CONNECTION UNAVAILABLE | Project ID: {project_id} | Cannot store PKG")
         return False
     
     try:
         with get_session() as session:
-            # Use write_transaction for atomic operations
-            session.execute_write(_store_package_tx, pkg)
-            session.execute_write(_store_project_tx, pkg)
-            
-            # Batch store modules
-            modules = pkg.get("modules", [])
-            if modules:
-                # Process in batches if needed
-                for i in range(0, len(modules), batch_size):
-                    batch = modules[i:i + batch_size]
-                    session.execute_write(_store_modules_tx, batch, pkg["project"]["id"])
-            
-            # Batch store symbols
-            symbols = pkg.get("symbols", [])
-            if symbols:
-                for i in range(0, len(symbols), batch_size):
-                    batch = symbols[i:i + batch_size]
-                    session.execute_write(_store_symbols_tx, batch, pkg["project"]["id"])
-            
-            # Batch store endpoints
-            endpoints = pkg.get("endpoints", [])
-            if endpoints:
-                for i in range(0, len(endpoints), batch_size):
-                    batch = endpoints[i:i + batch_size]
-                    session.execute_write(_store_endpoints_tx, batch, pkg["project"]["id"])
-            
-            # Batch store edges
-            edges = pkg.get("edges", [])
-            if edges:
-                for i in range(0, len(edges), batch_size):
-                    batch = edges[i:i + batch_size]
-                    session.execute_write(_store_edges_tx, batch)
-            
-            # Batch store features
-            features = pkg.get("features", [])
-            if features:
-                session.execute_write(_store_features_tx, features, pkg["project"]["id"])
-            
-            logger.info(f"Successfully stored PKG for project: {pkg['project'].get('id', 'unknown')}")
-            return True
-            
+            try:
+                # Store Package node
+                logger.debug(f"📦 STORING PACKAGE NODE | Project ID: {project_id}")
+                session.execute_write(_store_package_tx, pkg)
+                logger.debug(f"✅ PACKAGE NODE STORED | Project ID: {project_id}")
+                
+                # Store Project node
+                logger.debug(f"📋 STORING PROJECT NODE | Project ID: {project_id}")
+                session.execute_write(_store_project_tx, pkg)
+                logger.debug(f"✅ PROJECT NODE STORED | Project ID: {project_id}")
+                
+                # Batch store modules
+                modules = pkg.get("modules", [])
+                if modules:
+                    logger.info(f"📦 STORING MODULES | Project ID: {project_id} | Count: {len(modules)} | Batch size: {batch_size}")
+                    for i in range(0, len(modules), batch_size):
+                        batch = modules[i:i + batch_size]
+                        session.execute_write(_store_modules_tx, batch, project_id)
+                    logger.info(f"✅ MODULES STORED | Project ID: {project_id} | Count: {len(modules)}")
+                
+                # Batch store symbols
+                symbols = pkg.get("symbols", [])
+                if symbols:
+                    logger.info(f"🔤 STORING SYMBOLS | Project ID: {project_id} | Count: {len(symbols)} | Batch size: {batch_size}")
+                    for i in range(0, len(symbols), batch_size):
+                        batch = symbols[i:i + batch_size]
+                        session.execute_write(_store_symbols_tx, batch, project_id)
+                    logger.info(f"✅ SYMBOLS STORED | Project ID: {project_id} | Count: {len(symbols)}")
+                
+                # Batch store endpoints
+                endpoints = pkg.get("endpoints", [])
+                if endpoints:
+                    logger.info(f"🌐 STORING ENDPOINTS | Project ID: {project_id} | Count: {len(endpoints)} | Batch size: {batch_size}")
+                    for i in range(0, len(endpoints), batch_size):
+                        batch = endpoints[i:i + batch_size]
+                        session.execute_write(_store_endpoints_tx, batch, project_id)
+                    logger.info(f"✅ ENDPOINTS STORED | Project ID: {project_id} | Count: {len(endpoints)}")
+                
+                # Batch store edges
+                edges = pkg.get("edges", [])
+                if edges:
+                    logger.info(f"🔗 STORING EDGES | Project ID: {project_id} | Count: {len(edges)} | Batch size: {batch_size}")
+                    for i in range(0, len(edges), batch_size):
+                        batch = edges[i:i + batch_size]
+                        session.execute_write(_store_edges_tx, batch)
+                    logger.info(f"✅ EDGES STORED | Project ID: {project_id} | Count: {len(edges)}")
+                
+                # Store features
+                features = pkg.get("features", [])
+                if features:
+                    logger.info(f"📁 STORING FEATURES | Project ID: {project_id} | Count: {len(features)}")
+                    session.execute_write(_store_features_tx, features, project_id)
+                    logger.info(f"✅ FEATURES STORED | Project ID: {project_id} | Count: {len(features)}")
+                
+                logger.info(f"✅ PKG STORED TO NEO4J | Project ID: {project_id} | Modules: {len(modules)} | Symbols: {len(symbols)} | Endpoints: {len(endpoints)} | Edges: {len(edges)} | Features: {len(features)}")
+                return True
+                
+            except Exception as tx_error:
+                logger.error(
+                    f"❌ TRANSACTION ERROR | Project ID: {project_id} | Error: {tx_error}",
+                    exc_info=True
+                )
+                raise  # Re-raise to be caught by outer try-except
+                
+    except ConnectionError as e:
+        logger.error(f"❌ NEO4J CONNECTION ERROR | Project ID: {project_id} | Error: {e}")
+        return False
     except Exception as e:
-        logger.error(f"Error storing PKG to Neo4j: {e}", exc_info=True)
+        logger.error(
+            f"❌ STORE PKG ERROR | Project ID: {project_id} | Error: {e}",
+            exc_info=True
+        )
         return False
 
 
@@ -489,6 +526,254 @@ def close_driver() -> None:
             logger.error(f"Error closing Neo4j driver: {e}")
         finally:
             driver = None
+
+
+def check_pkg_stored(project_id: str) -> bool:
+    """
+    Check if PKG for a project is already stored in Neo4j.
+    
+    Args:
+        project_id: Project ID to check
+        
+    Returns:
+        True if project exists in Neo4j, False otherwise
+    """
+    logger.debug(f"🔍 CHECKING PKG IN NEO4J | Project ID: {project_id}")
+    if not verify_connection():
+        logger.warning(f"⚠️  NEO4J NOT CONNECTED | Project ID: {project_id} | Cannot check PKG")
+        return False
+    
+    try:
+        with get_session() as session:
+            result = session.run(
+                "MATCH (p:Project {id: $project_id}) RETURN p",
+                {"project_id": project_id}
+            )
+            record = result.single()
+            exists = record is not None
+            if exists:
+                logger.info(f"✅ PKG FOUND IN NEO4J | Project ID: {project_id}")
+            else:
+                logger.info(f"ℹ️  PKG NOT IN NEO4J | Project ID: {project_id}")
+            return exists
+    except Exception as e:
+        logger.error(f"❌ ERROR CHECKING PKG | Project ID: {project_id} | Error: {e}")
+        return False
+
+
+def load_pkg_from_neo4j(project_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Load PKG data from Neo4j and reconstruct the full PKG JSON structure.
+    
+    Args:
+        project_id: Project ID to load
+        
+    Returns:
+        Complete PKG dictionary matching the schema from pkg_generator.py,
+        or None if project not found or on error
+    """
+    logger.info(f"📥 LOADING PKG FROM NEO4J | Project ID: {project_id}")
+    if not verify_connection():
+        logger.warning(f"⚠️  NEO4J NOT CONNECTED | Project ID: {project_id} | Cannot load PKG")
+        return None
+    
+    # Check if project exists first
+    if not check_pkg_stored(project_id):
+        logger.warning(f"⚠️  PROJECT NOT FOUND | Project ID: {project_id} | Not in Neo4j")
+        return None
+    
+    try:
+        with get_session() as session:
+            # 1. Load Package node (version, generatedAt, gitSha)
+            package_data = {}
+            result = session.run(
+                "MATCH (pkg:Package {id: $project_id}) RETURN pkg",
+                {"project_id": project_id}
+            )
+            record = result.single()
+            if record:
+                pkg_node = record["pkg"]
+                package_data = {
+                    "version": pkg_node.get("version", "1.0.0"),
+                    "generatedAt": pkg_node.get("generatedAt"),
+                    "gitSha": pkg_node.get("gitSha")
+                }
+            
+            # 2. Load Project node and Metadata
+            project_data = {}
+            metadata_data = {}
+            result = session.run("""
+                MATCH (proj:Project {id: $project_id})
+                OPTIONAL MATCH (proj)-[:HAS_METADATA]->(m:Metadata {projectId: $project_id})
+                RETURN proj, m
+            """, {"project_id": project_id})
+            record = result.single()
+            if record:
+                proj_node = record["proj"]
+                project_data = {
+                    "id": proj_node.get("id", project_id),
+                    "name": proj_node.get("name", ""),
+                    "rootPath": proj_node.get("rootPath", ""),
+                    "languages": proj_node.get("languages", [])
+                }
+                if record["m"]:
+                    meta_node = record["m"]
+                    # Extract all metadata properties except projectId
+                    metadata_data = {k: v for k, v in meta_node.items() if k != "projectId"}
+            
+            if not project_data:
+                logger.warning(f"Project node not found for {project_id}")
+                return None
+            
+            project_data["metadata"] = metadata_data
+            
+            # 3. Load Modules
+            modules = []
+            result = session.run("""
+                MATCH (proj:Project {id: $project_id})-[:HAS_MODULE]->(mod:Module)
+                RETURN mod
+                ORDER BY mod.id
+            """, {"project_id": project_id})
+            for record in result:
+                mod_node = record["mod"]
+                module_dict = {"id": mod_node.get("id")}
+                # Add all other properties
+                for key, value in mod_node.items():
+                    if key != "id" and value is not None:
+                        module_dict[key] = value
+                modules.append(module_dict)
+            
+            # 4. Load Symbols
+            symbols = []
+            result = session.run("""
+                MATCH (proj:Project {id: $project_id})-[:HAS_SYMBOL]->(sym:Symbol)
+                RETURN sym
+                ORDER BY sym.id
+            """, {"project_id": project_id})
+            for record in result:
+                sym_node = record["sym"]
+                symbol_dict = {
+                    "id": sym_node.get("id"),
+                    "name": sym_node.get("name", "")
+                }
+                # Add all other properties except id and name
+                for key, value in sym_node.items():
+                    if key not in ["id", "name"] and value is not None:
+                        symbol_dict[key] = value
+                symbols.append(symbol_dict)
+            
+            # 5. Load Endpoints
+            endpoints = []
+            result = session.run("""
+                MATCH (proj:Project {id: $project_id})-[:HAS_ENDPOINT]->(end:Endpoint)
+                RETURN end
+                ORDER BY end.id
+            """, {"project_id": project_id})
+            for record in result:
+                end_node = record["end"]
+                endpoint_dict = {
+                    "id": end_node.get("id"),
+                    "path": end_node.get("path", "")
+                }
+                # Add all other properties except id and path
+                for key, value in end_node.items():
+                    if key not in ["id", "path"] and value is not None:
+                        endpoint_dict[key] = value
+                endpoints.append(endpoint_dict)
+            
+            # 6. Load Features
+            features = []
+            feature_module_map = {}  # feature_id -> [module_ids]
+            result = session.run("""
+                MATCH (proj:Project {id: $project_id})-[:HAS_FEATURE]->(f:Feature)
+                RETURN f
+                ORDER BY f.id
+            """, {"project_id": project_id})
+            for record in result:
+                feat_node = record["f"]
+                feature_id = feat_node.get("id")
+                feature_dict = {
+                    "id": feature_id,
+                    "name": feat_node.get("name", ""),
+                    "path": feat_node.get("path", ""),
+                    "moduleIds": []
+                }
+                features.append(feature_dict)
+                feature_module_map[feature_id] = []
+            
+            # 7. Load Feature-Module links
+            if feature_module_map:
+                feature_ids = list(feature_module_map.keys())
+                result = session.run("""
+                    MATCH (f:Feature)-[:CONTAINS]->(m:Module)
+                    WHERE f.id IN $feature_ids
+                    RETURN f.id AS feature_id, m.id AS module_id
+                """, {"feature_ids": feature_ids})
+                for record in result:
+                    feat_id = record["feature_id"]
+                    mod_id = record["module_id"]
+                    if feat_id in feature_module_map:
+                        feature_module_map[feat_id].append(mod_id)
+                
+                # Update features with module IDs
+                for feature in features:
+                    feature_id = feature["id"]
+                    if feature_id in feature_module_map:
+                        feature["moduleIds"] = feature_module_map[feature_id]
+            
+            # 8. Load Edges (relationships between Modules/Symbols)
+            edges = []
+            # Query all relationship types between Module and Symbol nodes that belong to this project
+            result = session.run("""
+                MATCH (proj:Project {id: $project_id})
+                MATCH (proj)-[:HAS_MODULE|HAS_SYMBOL]->(a)
+                MATCH (a)-[r]->(b)
+                WHERE (b:Module OR b:Symbol)
+                AND (
+                    EXISTS { MATCH (proj)-[:HAS_MODULE]->(b) } OR
+                    EXISTS { MATCH (proj)-[:HAS_SYMBOL]->(b) }
+                )
+                RETURN type(r) AS rel_type, a.id AS from_id, b.id AS to_id, r.weight AS weight
+            """, {"project_id": project_id})
+            for record in result:
+                edge_dict = {
+                    "from": record["from_id"],
+                    "to": record["to_id"],
+                    "type": record["rel_type"]
+                }
+                if record["weight"] is not None:
+                    edge_dict["weight"] = record["weight"]
+                edges.append(edge_dict)
+            
+            # Reconstruct PKG dict matching the schema
+            pkg = {
+                "version": package_data.get("version", "1.0.0"),
+                "generatedAt": package_data.get("generatedAt"),
+                "gitSha": package_data.get("gitSha"),
+                "project": project_data,
+                "modules": modules,
+                "symbols": symbols,
+                "endpoints": endpoints,
+                "edges": edges
+            }
+            
+            # Add features if they exist
+            if features:
+                pkg["features"] = features
+            
+            logger.info(f"✅ PKG LOADED FROM NEO4J | Project ID: {project_id} | Modules: {len(modules)} | Symbols: {len(symbols)} | Endpoints: {len(endpoints)} | Edges: {len(edges)} | Features: {len(features)}")
+            
+            return pkg
+            
+    except ConnectionError as e:
+        logger.error(f"❌ NEO4J CONNECTION ERROR | Project ID: {project_id} | Error: {e}")
+        return None
+    except Exception as e:
+        logger.error(
+            f"❌ LOAD PKG ERROR | Project ID: {project_id} | Error: {e}",
+            exc_info=True
+        )
+        return None
 
 
 # Initialize driver on module import

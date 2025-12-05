@@ -1,6 +1,7 @@
 """PKG Query Engine - Queries the Project Knowledge Graph."""
 
 import logging
+import os
 import re
 from typing import Dict, Any, List, Set, Optional
 
@@ -50,6 +51,7 @@ class PKGQueryEngine:
         Returns:
             List of matching modules
         """
+        logger.debug(f"🔍 QUERY: get_modules_by_tag | Tag: {tag} | Project: {self.project_id}")
         tag_lower = tag.lower()
         matching_modules = []
         
@@ -62,6 +64,7 @@ class PKGQueryEngine:
                         matching_modules.append(module)
                         break
         
+        logger.info(f"✅ QUERY RESULT: get_modules_by_tag | Tag: {tag} | Found: {len(matching_modules)} modules")
         return matching_modules
     
     def get_modules_by_path_pattern(self, pattern: str) -> List[Dict[str, Any]]:
@@ -125,9 +128,11 @@ class PKGQueryEngine:
         Returns:
             Dictionary with impacted_modules, impacted_files, and dependency graph
         """
+        logger.info(f"🔍 QUERY: get_impacted_modules | Project: {self.project_id} | Module IDs: {len(module_ids)} | Depth: {depth}")
         # Use Neo4j if available for complex transitive queries
         if self.neo4j_engine and self.project_id:
             try:
+                logger.debug(f"🌐 USING NEO4J ENGINE | Project: {self.project_id}")
                 result = self.neo4j_engine.get_impacted_modules(module_ids, depth)
                 # Convert Neo4j node objects to dictionaries if needed
                 if result.get("impacted_modules"):
@@ -138,9 +143,10 @@ class PKGQueryEngine:
                         else:
                             impacted_modules.append(mod)
                     result["impacted_modules"] = impacted_modules
+                logger.info(f"✅ QUERY RESULT: get_impacted_modules | Found: {len(result.get('impacted_modules', []))} impacted modules")
                 return result
             except Exception as e:
-                logger.warning(f"Neo4j query failed, falling back to in-memory: {e}")
+                logger.warning(f"⚠️  NEO4J QUERY FAILED | Project: {self.project_id} | Error: {e} | Falling back to in-memory")
         
         # Fallback to in-memory implementation
         impacted_module_ids: Set[str] = set(module_ids)
@@ -404,3 +410,77 @@ class PKGQueryEngine:
                 matching_endpoints.append(endpoint)
         
         return matching_endpoints
+    
+    def get_modules_by_filename(self, filename: str) -> List[Dict[str, Any]]:
+        """
+        Find modules by exact filename or partial match.
+        
+        Args:
+            filename: Filename to search for (e.g., "main.ts", "app.component.ts")
+            
+        Returns:
+            List of matching modules
+        """
+        matches = []
+        filename_lower = filename.lower()
+        
+        for module in self.modules:
+            path = module.get('path', '')
+            basename = os.path.basename(path).lower()
+            # Exact match or partial match (e.g., "app.component.ts" matches "app.component.ts")
+            if filename_lower == basename or filename_lower in basename:
+                matches.append(module)
+        
+        return matches
+    
+    def get_entry_point_modules(self) -> List[Dict[str, Any]]:
+        """
+        Find common entry point files (main.ts, index.ts, app.py, main.py, etc.).
+        
+        Returns:
+            List of entry point modules
+        """
+        entry_patterns = [
+            'main.ts', 'main.js', 'main.tsx', 'main.jsx',
+            'index.ts', 'index.js', 'index.tsx', 'index.jsx',
+            'app.py', 'main.py', '__main__.py',
+            'main.java', 'Application.java',
+            'Program.cs', 'Main.cs',
+            'main.cpp', 'main.c'
+        ]
+        
+        entry_modules = []
+        for module in self.modules:
+            path = module.get('path', '').lower()
+            basename = os.path.basename(path) if path else ''
+            if basename in entry_patterns:
+                entry_modules.append(module)
+        
+        return entry_modules
+    
+    def get_app_component_modules(self) -> List[Dict[str, Any]]:
+        """
+        Find app component files (app.component.ts, App.tsx, App.jsx, etc.).
+        
+        Returns:
+            List of app component modules
+        """
+        component_patterns = [
+            'app.component.ts', 'app.component.js',
+            'app.tsx', 'app.jsx', 'app.ts', 'app.js',
+            'app.component.tsx', 'app.component.jsx',
+            'appcomponent.tsx', 'appcomponent.jsx',
+            'main.component.ts', 'root.component.ts'
+        ]
+        
+        component_modules = []
+        for module in self.modules:
+            path = module.get('path', '')
+            basename = os.path.basename(path).lower() if path else ''
+            if basename in component_patterns:
+                component_modules.append(module)
+            # Also check if path contains "app" and "component"
+            elif 'app' in path.lower() and 'component' in path.lower():
+                component_modules.append(module)
+        
+        return component_modules

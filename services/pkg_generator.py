@@ -348,26 +348,43 @@ class PKGGenerator:
         Returns:
             Complete PKG dictionary
         """
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        logger.info(f"🏗️  STARTING PKG GENERATION | Repo: {self.repo_path}")
+        
         # Extract project metadata
+        logger.info(f"📋 EXTRACTING PROJECT METADATA | Repo: {self.repo_path}")
         project_meta = extract_project_metadata(self.repo_path)
+        project_id = project_meta.get("id", "unknown")
+        logger.info(f"✅ PROJECT METADATA EXTRACTED | Project ID: {project_id} | Name: {project_meta.get('name', 'N/A')} | Languages: {project_meta.get('languages', [])}")
         
         # Build modules
+        logger.info(f"📦 BUILDING MODULES | Repo: {self.repo_path}")
         self.modules = self._build_modules()
+        logger.info(f"✅ MODULES BUILT | Count: {len(self.modules)}")
         
         # Build symbols (need fan stats, so do a first pass)
         # For now, build symbols without fan filtering, then recalculate
+        logger.info(f"🔤 BUILDING SYMBOLS (first pass) | Repo: {self.repo_path}")
         temp_symbols = self._build_symbols(self.modules, {})
         self.symbols = temp_symbols
+        logger.info(f"✅ SYMBOLS BUILT (first pass) | Count: {len(self.symbols)}")
         
         # Build endpoints
+        logger.info(f"🌐 BUILDING ENDPOINTS | Repo: {self.repo_path}")
         self.endpoints = self._build_endpoints(self.modules)
+        logger.info(f"✅ ENDPOINTS BUILT | Count: {len(self.endpoints)}")
         
         # Extract relationships
+        logger.info(f"🔗 EXTRACTING RELATIONSHIPS | Repo: {self.repo_path}")
         self.edges, fan_stats = extract_relationships(
             self.modules, self.symbols, self.endpoints, self.repo_path
         )
+        logger.info(f"✅ RELATIONSHIPS EXTRACTED | Edges: {len(self.edges)}")
         
         # Populate module imports from edges
+        logger.debug(f"📥 POPULATING MODULE IMPORTS | Repo: {self.repo_path}")
         for edge in self.edges:
             if edge.get("type") == "imports":
                 from_id = edge.get("from")
@@ -378,12 +395,21 @@ class PKGGenerator:
                             module["imports"].append(to_id)
         
         # Rebuild symbols with fan filtering
+        logger.info(f"🔤 REBUILDING SYMBOLS (with fan filtering) | Repo: {self.repo_path} | Fan threshold: {self.fan_threshold}")
         self.symbols = self._build_symbols(self.modules, fan_stats)
+        logger.info(f"✅ SYMBOLS REBUILT | Count: {len(self.symbols)}")
         
         # Build features
-        self.features = self._build_features(self.modules)
+        if self.include_features:
+            logger.info(f"📁 BUILDING FEATURES | Repo: {self.repo_path}")
+            self.features = self._build_features(self.modules)
+            logger.info(f"✅ FEATURES BUILT | Count: {len(self.features)}")
+        else:
+            self.features = []
+            logger.info(f"⏭️  SKIPPING FEATURES | Repo: {self.repo_path} | include_features=False")
         
         # Clean up module definitions (remove file_path, keep only needed fields)
+        logger.debug(f"🧹 CLEANING UP MODULE DATA | Repo: {self.repo_path}")
         for module in self.modules:
             module.pop("definitions", None)
             module.pop("file_path", None)
@@ -392,6 +418,7 @@ class PKGGenerator:
                 module["moduleSummary"] = None
         
         # Build final PKG
+        logger.info(f"📦 BUILDING FINAL PKG STRUCTURE | Repo: {self.repo_path}")
         pkg = {
             "version": "1.0.0",
             "generatedAt": datetime.utcnow().isoformat() + "Z",
@@ -414,11 +441,16 @@ class PKGGenerator:
         
         # Save if output path provided
         if output_path:
+            logger.info(f"💾 SAVING PKG TO FILE | Path: {output_path}")
             os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
             with open(output_path, 'w', encoding='utf-8') as f:
                 json.dump(pkg, f, indent=2)
+            logger.info(f"✅ PKG SAVED TO FILE | Path: {output_path}")
         
+        logger.info(f"💾 STORING PKG TO NEO4J | Project ID: {project_id}")
         neo4j_database.store_pkg(pkg)
+        logger.info(f"✅ PKG STORED TO NEO4J | Project ID: {project_id}")
 
+        logger.info(f"✅ PKG GENERATION COMPLETE | Repo: {self.repo_path} | Project ID: {project_id} | Modules: {len(self.modules)} | Symbols: {len(self.symbols)} | Edges: {len(self.edges)} | Endpoints: {len(self.endpoints)}")
         return pkg        
 

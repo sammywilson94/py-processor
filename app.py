@@ -11,10 +11,11 @@ from routes.pdf_routes import pdf_bp
 # Load environment variables
 load_dotenv()
 
-# Configure logging
+# Configure logging with enhanced format for better debugging
+log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=getattr(logging, log_level, logging.INFO),
+    format='%(asctime)s | %(levelname)-8s | %(name)-30s | %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
@@ -102,13 +103,20 @@ def create_app() -> Flask:
             cors_origins = [origin.strip() for origin in cors_origins_env.split(',')]
         
         async_mode = os.getenv('WEBSOCKET_ASYNC_MODE', 'eventlet')
+        # Configure ping/pong settings to prevent premature timeouts
+        ping_timeout = int(os.getenv('WEBSOCKET_PING_TIMEOUT', '60'))  # Default 60 seconds
+        ping_interval = int(os.getenv('WEBSOCKET_PING_INTERVAL', '25'))  # Default 25 seconds
+        
         socketio = SocketIO(
             app, 
             cors_allowed_origins=cors_origins, 
             async_mode=async_mode,
             logger=True,
-            engineio_logger=True
+            engineio_logger=True,
+            ping_timeout=ping_timeout,
+            ping_interval=ping_interval
         )
+        logger.info(f"SocketIO initialized with ping_timeout={ping_timeout}s, ping_interval={ping_interval}s")
         logger.info(f"SocketIO initialized with CORS origins: {cors_origins}, async_mode: {async_mode}")
         
         # Register chat routes
