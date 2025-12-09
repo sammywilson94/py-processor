@@ -11,6 +11,7 @@ from flask_socketio import SocketIO
 
 from services.parser_service import generate_pkg
 import db.neo4j_db as neo4j_db
+from git import Repo
 
 logger = logging.getLogger(__name__)
 
@@ -226,7 +227,8 @@ class AgentOrchestrator:
         session_id: str,
         repo_url: Optional[str] = None,
         socketio: Optional[SocketIO] = None,
-        sid: Optional[str] = None
+        sid: Optional[str] = None,
+        auto_fork: bool = True
     ) -> tuple:
         """
         Ensure repository is cloned and PKG is loaded.
@@ -236,6 +238,7 @@ class AgentOrchestrator:
             repo_url: Optional repository URL (if None, uses session's repo_url)
             socketio: Optional SocketIO instance for streaming updates
             sid: Optional socket session ID
+            auto_fork: If True, automatically fork repositories not owned by authenticated user
         
         Returns:
             Tuple of (repo_path, pkg_data) or (None, None) on failure
@@ -254,12 +257,67 @@ class AgentOrchestrator:
                     return None, None
                 logger.info(f"📋 USING SESSION REPO URL | Session: {session_id} | URL: {repo_url}")
             
-            # Check if already loaded in session cache
+            # Store original URL before potential fork
+            original_repo_url = repo_url
+            fork_info = None
+            
+            # Check if auto-forking is needed (BEFORE cache/Neo4j checks)
+            if auto_fork:
+                logger.info(f"🔍 CHECKING FORK STATUS | Session: {session_id} | URL: {repo_url}")
+                owner, repo_name_parsed = self._parse_repo_url(repo_url)
+                
+                if owner and repo_name_parsed:
+                    try:
+                        # Initialize PRCreator to access GitHub API
+                        # Use a temporary path for PRCreator initialization (it needs a repo path)
+                        temp_repo_path = os.path.join(os.getcwd(), "cloned_repos", ".temp")
+                        os.makedirs(temp_repo_path, exist_ok=True)
+                        
+                        from agents.pr_creator import PRCreator
+                        pr_creator = PRCreator(temp_repo_path)
+                        
+                        if pr_creator.github:
+                            logger.info(f"🔐 AUTHENTICATED GITHUB USER AVAILABLE | Session: {session_id} | Checking ownership...")
+                            
+                            # Fork repository if needed
+                            fork_info = pr_creator.fork_repository(owner, repo_name_parsed)
+                            
+                            if fork_info.get('success'):
+                                if fork_info.get('already_owned'):
+                                    logger.info(f"✅ REPO OWNED BY USER | Session: {session_id} | No fork needed")
+                                else:
+                                    logger.info(f"🍴 FORK OPERATION SUCCESSFUL | Session: {session_id} | Fork URL: {fork_info.get('fork_url')}")
+                                    repo_url = fork_info.get('fork_url')
+                                    if socketio and sid:
+                                        self._stream_update(
+                                            socketio, sid, "log", "repo_loading",
+                                            {"message": f"Forked repository: {fork_info.get('fork_url')}"},
+                                            session_id
+                                        )
+                            else:
+                                logger.warning(f"⚠️  FORK OPERATION FAILED | Session: {session_id} | Error: {fork_info.get('error')} | Falling back to original URL")
+                                # Continue with original URL
+                        else:
+                            logger.warning(f"⚠️  GITHUB TOKEN NOT AVAILABLE | Session: {session_id} | Skipping fork, using original URL")
+                    except Exception as e:
+                        logger.error(f"❌ ERROR DURING FORK CHECK | Session: {session_id} | Error: {e}", exc_info=True)
+                        # Continue with original URL
+                else:
+                    logger.warning(f"⚠️  COULD NOT PARSE REPO URL | Session: {session_id} | URL: {repo_url} | Skipping fork check")
+            
+            # Store fork information in session for later use
+            if session_id not in self.sessions:
+                self.sessions[session_id] = {}
+            self.sessions[session_id]['original_repo_url'] = original_repo_url
+            if fork_info:
+                self.sessions[session_id]['fork_info'] = fork_info
+            
+            # Check if already loaded in session cache (using potentially forked repo_url)
             if session.get('repo_url') == repo_url and session.get('pkg_data'):
                 logger.info(f"✅ USING CACHED PKG | Session: {session_id} | Repo: {repo_url}")
                 return session.get('repo_path'), session.get('pkg_data')
             
-            # Extract project_id from repo_url (before cloning)
+            # Extract project_id from repo_url (after fork, before cloning)
             # Use same logic as extract_project_metadata: repo_name from URL
             project_id = os.path.splitext(os.path.basename(repo_url))[0]
             logger.info(f"🔍 PROJECT ID EXTRACTED | Session: {session_id} | Project ID: {project_id}")
@@ -288,6 +346,9 @@ class AgentOrchestrator:
                     if session_id not in self.sessions:
                         self.sessions[session_id] = {}
                     self.sessions[session_id]['repo_url'] = repo_url
+                    self.sessions[session_id]['original_repo_url'] = original_repo_url
+                    if fork_info:
+                        self.sessions[session_id]['fork_info'] = fork_info
                     self.sessions[session_id]['repo_path'] = repo_path
                     self.sessions[session_id]['pkg_data'] = pkg_data
                     
@@ -345,6 +406,41 @@ class AgentOrchestrator:
                     logger.info(f"⏳ CLONING IN PROGRESS | Session: {session_id} | This may take a while...")
                     subprocess.run([git_cmd, "clone", repo_url, folder_path], check=True)
                     logger.info(f"✅ REPOSITORY CLONED | Session: {session_id} | Path: {folder_path}")
+                    
+                    # Configure git remotes after cloning
+                    if fork_info and fork_info.get('success') and not fork_info.get('already_owned'):
+                        try:
+                            logger.info(f"🔧 CONFIGURING GIT REMOTES | Session: {session_id} | Setting up origin and upstream")
+                            repo = Repo(folder_path)
+                            
+                            # Set origin to fork URL (for pushing)
+                            if 'origin' in [remote.name for remote in repo.remotes]:
+                                origin = repo.remote('origin')
+                                origin.set_url(fork_info.get('fork_url'))
+                            else:
+                                origin = repo.create_remote('origin', fork_info.get('fork_url'))
+                            
+                            logger.info(f"✅ ORIGIN REMOTE SET | Session: {session_id} | URL: {fork_info.get('fork_url')}")
+                            
+                            # Add upstream remote pointing to original URL (for syncing)
+                            if 'upstream' in [remote.name for remote in repo.remotes]:
+                                upstream = repo.remote('upstream')
+                                upstream.set_url(original_repo_url)
+                            else:
+                                upstream = repo.create_remote('upstream', original_repo_url)
+                            
+                            logger.info(f"✅ UPSTREAM REMOTE SET | Session: {session_id} | URL: {original_repo_url}")
+                            
+                            if socketio and sid:
+                                self._stream_update(
+                                    socketio, sid, "log", "repo_loading",
+                                    {"message": f"Configured git remotes: origin → fork, upstream → original"},
+                                    session_id
+                                )
+                        except Exception as e:
+                            logger.warning(f"⚠️  FAILED TO CONFIGURE REMOTES | Session: {session_id} | Error: {e}", exc_info=True)
+                            # Continue even if remote configuration fails
+                    
                 except FileNotFoundError:
                     logger.error(f"❌ GIT NOT FOUND | Session: {session_id} | Git executable not found")
                     return None, None
@@ -353,6 +449,30 @@ class AgentOrchestrator:
                     return None, None
             else:
                 logger.info(f"✅ REPO ALREADY EXISTS | Session: {session_id} | Path: {folder_path} | Skipping clone")
+                
+                # Configure remotes even if repo already exists (in case it was cloned before fork logic was added)
+                if fork_info and fork_info.get('success') and not fork_info.get('already_owned'):
+                    try:
+                        logger.info(f"🔧 CONFIGURING GIT REMOTES (EXISTING REPO) | Session: {session_id}")
+                        repo = Repo(folder_path)
+                        
+                        # Set origin to fork URL
+                        if 'origin' in [remote.name for remote in repo.remotes]:
+                            origin = repo.remote('origin')
+                            origin.set_url(fork_info.get('fork_url'))
+                        else:
+                            origin = repo.create_remote('origin', fork_info.get('fork_url'))
+                        
+                        # Add upstream remote
+                        if 'upstream' in [remote.name for remote in repo.remotes]:
+                            upstream = repo.remote('upstream')
+                            upstream.set_url(original_repo_url)
+                        else:
+                            upstream = repo.create_remote('upstream', original_repo_url)
+                        
+                        logger.info(f"✅ REMOTES CONFIGURED | Session: {session_id} | origin: {fork_info.get('fork_url')}, upstream: {original_repo_url}")
+                    except Exception as e:
+                        logger.warning(f"⚠️  FAILED TO CONFIGURE REMOTES (EXISTING REPO) | Session: {session_id} | Error: {e}", exc_info=True)
             
             # Update project_id from actual repo path (same as extract_project_metadata)
             project_id = Path(folder_path).name
@@ -379,6 +499,9 @@ class AgentOrchestrator:
             if session_id not in self.sessions:
                 self.sessions[session_id] = {}
             self.sessions[session_id]['repo_url'] = repo_url
+            self.sessions[session_id]['original_repo_url'] = original_repo_url
+            if fork_info:
+                self.sessions[session_id]['fork_info'] = fork_info
             self.sessions[session_id]['repo_path'] = folder_path
             self.sessions[session_id]['pkg_data'] = pkg_data
             
@@ -451,6 +574,32 @@ class AgentOrchestrator:
         except Exception as e:
             logger.error(f"Error loading PKG: {e}", exc_info=True)
             return None
+    
+    def _parse_repo_url(self, url: str) -> tuple:
+        """
+        Parse owner and repo name from GitHub URL.
+        
+        Args:
+            url: Repository URL (HTTPS or SSH format)
+            
+        Returns:
+            Tuple of (owner, repo_name) or (None, None) on failure
+        """
+        try:
+            # Handle different URL formats
+            if 'github.com' in url:
+                # https://github.com/owner/repo.git or git@github.com:owner/repo.git
+                parts = url.split('github.com/')[-1].split('github.com:')[-1]
+                parts = parts.replace('.git', '').strip('/')
+                path_parts = parts.split('/')
+                
+                if len(path_parts) >= 2:
+                    return path_parts[0], path_parts[1]
+            
+            return None, None
+        except Exception as e:
+            logger.error(f"Error parsing repo URL: {e}", exc_info=True)
+            return None, None
     
     def _stream_update(
         self,
@@ -717,6 +866,59 @@ class AgentOrchestrator:
                         },
                         session_id
                     )
+                
+                # Stream validation results for transparency
+                validation_results = edit_result.get('validation_results', [])
+                if validation_results:
+                    total_warnings = 0
+                    total_errors = 0
+                    validation_summary = []
+                    
+                    for val_result in validation_results:
+                        file_path = val_result.get('file', 'unknown')
+                        validation = val_result.get('validation', {})
+                        errors = validation.get('errors', [])
+                        warnings = validation.get('warnings', [])
+                        
+                        total_errors += len(errors)
+                        total_warnings += len(warnings)
+                        
+                        if errors or warnings:
+                            validation_summary.append({
+                                "file": file_path,
+                                "errors": errors,
+                                "warnings": warnings,
+                                "valid": validation.get('valid', True)
+                            })
+                    
+                    # Stream validation summary
+                    if validation_summary or total_warnings > 0 or total_errors > 0:
+                        self._stream_update(
+                            socketio, sid, "log", "editing",
+                            {
+                                "message": f"Code validation complete: {len(validation_results)} files validated",
+                                "validation_summary": {
+                                    "total_files": len(validation_results),
+                                    "total_errors": total_errors,
+                                    "total_warnings": total_warnings,
+                                    "file_results": validation_summary
+                                }
+                            },
+                            session_id
+                        )
+                    else:
+                        self._stream_update(
+                            socketio, sid, "log", "editing",
+                            {
+                                "message": f"Code validation complete: {len(validation_results)} files validated successfully",
+                                "validation_summary": {
+                                    "total_files": len(validation_results),
+                                    "total_errors": 0,
+                                    "total_warnings": 0
+                                }
+                            },
+                            session_id
+                        )
                 
                 # Generate overall diff
                 diff = editor.generate_diff()

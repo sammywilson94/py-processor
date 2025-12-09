@@ -75,6 +75,7 @@ class CodeEditExecutor:
         tasks = plan.get('tasks', [])
         changes = []
         errors = []
+        validation_results = []
         
         for task in tasks:
             task_id = task.get('task_id', 0)
@@ -105,11 +106,20 @@ class CodeEditExecutor:
                             "diff": edit_result.get('diff', ''),
                             "task_id": task_id
                         })
+                        
+                        # Collect validation result
+                        if edit_result.get('validation'):
+                            validation_results.append({
+                                "file": file_path,
+                                "validation": edit_result['validation'],
+                                "task_id": task_id
+                            })
                     else:
                         errors.append({
                             "file": file_path,
                             "error": edit_result.get('error', 'Unknown error'),
-                            "task_id": task_id
+                            "task_id": task_id,
+                            "validation": edit_result.get('validation')
                         })
                 
                 except Exception as e:
@@ -123,6 +133,7 @@ class CodeEditExecutor:
         return {
             "changes": changes,
             "errors": errors,
+            "validation_results": validation_results,
             "total_files": len(changes),
             "success": len(errors) == 0
         }
@@ -169,6 +180,7 @@ class CodeEditExecutor:
                 }
             
             # Validate code before writing
+            validation_result = None
             try:
                 from agents.code_validator import CodeValidator
                 validator = CodeValidator(self.repo_path)
@@ -178,7 +190,8 @@ class CodeEditExecutor:
                     return {
                         "success": False,
                         "error": f"Validation failed: {'; '.join(validation_result['errors'])}",
-                        "diff": ""
+                        "diff": "",
+                        "validation": validation_result
                     }
                 
                 # Log warnings if any
@@ -187,6 +200,12 @@ class CodeEditExecutor:
             except Exception as e:
                 logger.warning(f"Code validation error: {e}", exc_info=True)
                 # Continue even if validation fails (non-blocking)
+                # Create a default validation result for error case
+                validation_result = {
+                    "valid": True,  # Don't block on validation errors
+                    "errors": [],
+                    "warnings": [f"Validation check failed: {str(e)}"]
+                }
             
             # Write modified content
             with open(file_path, 'w', encoding='utf-8') as f:
@@ -198,7 +217,12 @@ class CodeEditExecutor:
             return {
                 "success": True,
                 "diff": diff,
-                "modified": True
+                "modified": True,
+                "validation": validation_result or {
+                    "valid": True,
+                    "errors": [],
+                    "warnings": []
+                }
             }
         
         except Exception as e:
@@ -258,18 +282,43 @@ class CodeEditExecutor:
                     # Find module in PKG by file path
                     # Convert file_path to relative path from repo root
                     rel_path = os.path.relpath(file_path, self.repo_path) if os.path.isabs(file_path) else file_path
+                    # Normalize path separators (handle both Windows and Unix)
+                    rel_path_normalized = rel_path.replace('\\', '/')
                     
-                    # Try to find module by path
+                    # Try to find module by path with multiple matching strategies
                     module = None
+                    module_id = None
+                    
+                    # Strategy 1: Exact match with normalized path
                     for mod in pkg_data.get('modules', []):
-                        if mod.get('path') == rel_path or mod.get('path') == file_path:
+                        mod_path = mod.get('path', '')
+                        mod_path_normalized = mod_path.replace('\\', '/')
+                        if mod_path_normalized == rel_path_normalized or mod_path == rel_path:
                             module = mod
                             break
                     
+                    # Strategy 2: Match by filename if exact path not found
+                    if not module:
+                        filename = os.path.basename(rel_path)
+                        for mod in pkg_data.get('modules', []):
+                            mod_path = mod.get('path', '')
+                            if os.path.basename(mod_path) == filename:
+                                module = mod
+                                logger.debug(f"Found module by filename match: {mod_path} for {rel_path}")
+                                break
+                    
                     if module:
                         module_id = module.get('id')
-                        intent = task.get('intent', {})
-                        context = context_analyzer.build_code_generation_context(module_id, intent)
+                        if not module_id:
+                            logger.warning(f"Module found but missing ID for path: {rel_path}")
+                            context = {}
+                        else:
+                            intent = task.get('intent', {})
+                            try:
+                                context = context_analyzer.build_code_generation_context(module_id, intent)
+                            except Exception as e:
+                                logger.warning(f"Failed to build code generation context for module {module_id}: {e}", exc_info=True)
+                                context = {}
                         
                         # Build context string for prompt
                         context_parts = []
@@ -303,6 +352,8 @@ class CodeEditExecutor:
                         
                         if context_parts:
                             context_info = "\n".join(context_parts) + "\n"
+                    else:
+                        logger.debug(f"Module not found in PKG for file: {rel_path} (tried normalized: {rel_path_normalized})")
                         
                 except Exception as e:
                     logger.warning(f"Failed to build PKG context: {e}", exc_info=True)

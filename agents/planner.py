@@ -71,7 +71,8 @@ class Planner:
         self,
         intent: Dict[str, Any],
         impact_result: Dict[str, Any],
-        constraints: List[str]
+        constraints: List[str],
+        pkg_data: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Call LLM to generate plan.
@@ -80,6 +81,7 @@ class Planner:
             intent: Intent dictionary
             impact_result: Impact analysis result
             constraints: List of constraints
+            pkg_data: Optional PKG data dictionary for context-aware planning
             
         Returns:
             Plan dictionary
@@ -97,6 +99,66 @@ class Planner:
             }
             module_summaries.append(module_info)
         
+        # Extract PKG context if available
+        pkg_context = ""
+        if pkg_data:
+            try:
+                from services.pkg_query_engine import PKGQueryEngine
+                from agents.code_context_analyzer import CodeContextAnalyzer
+                
+                query_engine = PKGQueryEngine(pkg_data)
+                context_analyzer = CodeContextAnalyzer(pkg_data, query_engine)
+                
+                # Extract framework patterns from project
+                project = pkg_data.get('project', {})
+                framework_type = project.get('framework', 'unknown')
+                languages = project.get('languages', [])
+                
+                # Get framework patterns from impacted modules
+                framework_patterns = []
+                import_patterns = []
+                code_conventions = []
+                
+                for module in impacted_modules[:5]:  # Limit to first 5 for context
+                    module_id = module.get('id')
+                    if module_id:
+                        try:
+                            patterns = context_analyzer.extract_code_patterns(module_id)
+                            if patterns.get('framework_type'):
+                                framework_type = patterns.get('framework_type')
+                            if patterns.get('patterns'):
+                                framework_patterns.extend(patterns.get('patterns', [])[:3])
+                            if patterns.get('style', {}).get('import_style'):
+                                import_patterns.append(patterns['style']['import_style'])
+                            if patterns.get('style', {}).get('naming_convention'):
+                                code_conventions.append(patterns['style']['naming_convention'])
+                        except Exception as e:
+                            logger.debug(f"Failed to extract patterns for module {module_id}: {e}")
+                
+                # Build PKG context string
+                pkg_context_parts = []
+                if framework_type and framework_type != 'unknown':
+                    pkg_context_parts.append(f"Framework: {framework_type}")
+                if languages:
+                    pkg_context_parts.append(f"Languages: {', '.join(languages)}")
+                if framework_patterns:
+                    unique_patterns = list(set(framework_patterns))[:5]
+                    pkg_context_parts.append(f"Code Patterns: {', '.join(unique_patterns)}")
+                if import_patterns:
+                    unique_imports = list(set(import_patterns))[:3]
+                    pkg_context_parts.append(f"Import Style: {', '.join(unique_imports)}")
+                if code_conventions:
+                    unique_conventions = list(set(code_conventions))[:3]
+                    pkg_context_parts.append(f"Naming Conventions: {', '.join(unique_conventions)}")
+                
+                if pkg_context_parts:
+                    pkg_context = "\n\nProject Context (from knowledge graph):\n" + "\n".join(f"- {part}" for part in pkg_context_parts) + "\n"
+                    pkg_context += "\nIMPORTANT: Follow the project's framework patterns, import styles, and naming conventions shown above when planning changes.\n"
+                
+            except Exception as e:
+                logger.warning(f"Failed to extract PKG context for planning: {e}", exc_info=True)
+                # Continue without PKG context if extraction fails
+        
         prompt = f"""You are a code-change planner. Given the following information, produce a detailed, step-by-step plan for implementing the requested changes.
 
 Intent: {intent.get('description', '')}
@@ -111,6 +173,7 @@ Affected Tests: {len(impact_result.get('affected_tests', []))} test files
 
 Constraints:
 {chr(10).join(f"- {c}" for c in constraints) if constraints else "- None specified"}
+{pkg_context}
 
 Produce a numbered plan of code edits with:
 1. Files to modify (relative path from repo root)

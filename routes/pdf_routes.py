@@ -11,6 +11,7 @@ from werkzeug.exceptions import RequestEntityTooLarge
 from services.pdf_service import PDFService
 from utils.response_formatter import success_response, error_response
 from services.parser_service import repo_to_json, generate_pkg
+from services.agent_orchestrator import AgentOrchestrator
 
 try:
     from agents import storing_agent
@@ -256,6 +257,48 @@ def clone_and_generate():
         if not repo_url:
             logger.error("Missing repo_url in request body")
             return error_response("repo_url is required", 400)
+
+        # Store original URL before potential fork
+        original_repo_url = repo_url
+        fork_info = None
+        
+        # Check if auto-forking is needed (BEFORE clone operation)
+        logger.info(f"🔍 CHECKING FORK STATUS | URL: {repo_url}")
+        orchestrator = AgentOrchestrator()
+        owner, repo_name_parsed = orchestrator._parse_repo_url(repo_url)
+        
+        if owner and repo_name_parsed:
+            try:
+                # Initialize PRCreator to access GitHub API
+                # Use a temporary path for PRCreator initialization (it needs a repo path)
+                temp_repo_path = os.path.join(os.getcwd(), "cloned_repos", ".temp")
+                os.makedirs(temp_repo_path, exist_ok=True)
+                
+                from agents.pr_creator import PRCreator
+                pr_creator = PRCreator(temp_repo_path)
+                
+                if pr_creator.github:
+                    logger.info(f"🔐 AUTHENTICATED GITHUB USER AVAILABLE | Checking ownership...")
+                    
+                    # Fork repository if needed
+                    fork_info = pr_creator.fork_repository(owner, repo_name_parsed)
+                    
+                    if fork_info.get('success'):
+                        if fork_info.get('already_owned'):
+                            logger.info(f"✅ REPO OWNED BY USER | No fork needed")
+                        else:
+                            logger.info(f"🍴 FORK OPERATION SUCCESSFUL | Fork URL: {fork_info.get('fork_url')}")
+                            repo_url = fork_info.get('fork_url')
+                    else:
+                        logger.warning(f"⚠️  FORK OPERATION FAILED | Error: {fork_info.get('error')} | Falling back to original URL")
+                        # Continue with original URL
+                else:
+                    logger.warning(f"⚠️  GITHUB TOKEN NOT AVAILABLE | Skipping fork, using original URL")
+            except Exception as e:
+                logger.error(f"❌ ERROR DURING FORK CHECK | Error: {e}", exc_info=True)
+                # Continue with original URL
+        else:
+            logger.warning(f"⚠️  COULD NOT PARSE REPO URL | URL: {repo_url} | Skipping fork check")
 
         # Parse optional parameters
         generate_summaries = request.args.get('generate_summaries', 'false').lower() == 'true'

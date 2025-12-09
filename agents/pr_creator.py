@@ -45,6 +45,128 @@ class PRCreator:
             logger.error(f"Failed to initialize GitHub client: {e}", exc_info=True)
             self.github = None
     
+    def fork_repository(self, owner: str, repo_name: str) -> Dict[str, Any]:
+        """
+        Fork a repository if not already forked by the authenticated user.
+        
+        Args:
+            owner: Repository owner username
+            repo_name: Repository name
+            
+        Returns:
+            Dictionary with success status, fork_url, fork_owner, html_url, original_url
+        """
+        if not self.github:
+            logger.warning("GitHub client not initialized, cannot fork repository")
+            return {
+                "success": False,
+                "error": "GitHub client not initialized",
+                "message": "GITHUB_TOKEN not configured"
+            }
+        
+        try:
+            # Get authenticated user
+            user = self.github.get_user()
+            authenticated_username = user.login
+            logger.info(f"Authenticated GitHub user: {authenticated_username}")
+            
+            # Get original repository
+            original_repo = self.github.get_repo(f"{owner}/{repo_name}")
+            original_url = original_repo.clone_url
+            original_html_url = original_repo.html_url
+            
+            logger.info(f"Checking fork status for {owner}/{repo_name}")
+            
+            # Check if repository is already owned by authenticated user
+            if owner.lower() == authenticated_username.lower():
+                logger.info(f"Repository {owner}/{repo_name} is owned by authenticated user, no fork needed")
+                return {
+                    "success": True,
+                    "fork_url": original_url,
+                    "fork_owner": authenticated_username,
+                    "html_url": original_html_url,
+                    "original_url": original_url,
+                    "already_owned": True
+                }
+            
+            # Check if fork already exists
+            # Try to get the fork directly
+            fork_repo = None
+            try:
+                # Check if user has a fork of this repository
+                fork_repo = user.get_repo(repo_name)
+                # Verify it's actually a fork of the original
+                if fork_repo.fork and fork_repo.parent and fork_repo.parent.full_name == f"{owner}/{repo_name}":
+                    logger.info(f"Found existing fork: {authenticated_username}/{repo_name}")
+                    fork_url = fork_repo.clone_url
+                    fork_html_url = fork_repo.html_url
+                else:
+                    # Not a fork, or not a fork of this repo
+                    fork_repo = None
+            except GithubException:
+                # Repository not found, need to create fork
+                fork_repo = None
+            
+            # If no existing fork found, create one
+            if not fork_repo:
+                logger.info(f"Creating fork of {owner}/{repo_name} for {authenticated_username}")
+                try:
+                    fork_repo = original_repo.create_fork()
+                    logger.info(f"Successfully created fork: {fork_repo.full_name}")
+                except GithubException as e:
+                    # Check if error is because fork already exists
+                    if "already exists" in str(e).lower() or "already a fork" in str(e).lower():
+                        logger.info(f"Fork already exists, attempting to retrieve it")
+                        # Try to get the fork again
+                        try:
+                            fork_repo = user.get_repo(repo_name)
+                        except GithubException:
+                            logger.error(f"Could not retrieve existing fork: {e}")
+                            return {
+                                "success": False,
+                                "error": f"Fork exists but could not be retrieved: {str(e)}",
+                                "original_url": original_url
+                            }
+                    else:
+                        logger.error(f"Failed to create fork: {e}", exc_info=True)
+                        return {
+                            "success": False,
+                            "error": f"Failed to create fork: {str(e)}",
+                            "original_url": original_url
+                        }
+            
+            fork_url = fork_repo.clone_url
+            fork_html_url = fork_repo.html_url
+            fork_owner = fork_repo.owner.login
+            
+            logger.info(f"Fork operation successful: {fork_owner}/{repo_name}")
+            logger.info(f"Fork URL: {fork_url}")
+            logger.info(f"Original URL: {original_url}")
+            
+            return {
+                "success": True,
+                "fork_url": fork_url,
+                "fork_owner": fork_owner,
+                "html_url": fork_html_url,
+                "original_url": original_url,
+                "already_owned": False
+            }
+        
+        except GithubException as e:
+            logger.error(f"GitHub API error during fork operation: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": f"GitHub API error: {str(e)}",
+                "original_url": f"https://github.com/{owner}/{repo_name}.git" if owner and repo_name else None
+            }
+        except Exception as e:
+            logger.error(f"Unexpected error during fork operation: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": str(e),
+                "original_url": f"https://github.com/{owner}/{repo_name}.git" if owner and repo_name else None
+            }
+    
     def push_branch(
         self,
         branch_name: str,
