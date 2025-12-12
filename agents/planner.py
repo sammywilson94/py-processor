@@ -67,6 +67,110 @@ class Planner:
             logger.error(f"LLM planning failed: {e}", exc_info=True)
             return self._fallback_plan(intent, impact_result, constraints)
     
+    def _should_exclude_path(self, file_path: str) -> bool:
+        """Check if path should be excluded from framework detection."""
+        return "cloned_repos" in file_path.replace("\\", "/")
+    
+    def _analyze_project_structure(self, repo_path: Optional[str], pkg_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Analyze actual project structure to infer framework and file patterns.
+        
+        Args:
+            repo_path: Path to repository root
+            pkg_data: Optional PKG data dictionary
+            
+        Returns:
+            Dictionary with 'framework', 'file_patterns', 'examples', 'hints'
+        """
+        import os
+        import glob
+        
+        if not repo_path or not os.path.exists(repo_path):
+            return {'framework': None, 'file_patterns': [], 'examples': [], 'hints': {}}
+        
+        framework_hints = {}
+        file_patterns = []
+        examples = []
+        
+        # Prioritize root-level Python/Flask detection
+        root_requirements = os.path.join(repo_path, 'requirements.txt')
+        root_app_py = os.path.join(repo_path, 'app.py')
+        flask_detected = False
+        
+        if os.path.exists(root_requirements):
+            try:
+                with open(root_requirements, 'r', encoding='utf-8') as f:
+                    content = f.read().lower()
+                    if "flask" in content:
+                        flask_detected = True
+                        framework_hints['flask'] = 100  # High priority
+                        examples.append('requirements.txt')
+            except Exception:
+                pass
+        
+        if os.path.exists(root_app_py):
+            flask_detected = True
+            if 'flask' not in framework_hints:
+                framework_hints['flask'] = 100
+            examples.append('app.py')
+        
+        # Check for Flask imports in root-level Python files (excluding cloned_repos)
+        if not flask_detected:
+            root_py_files = glob.glob(os.path.join(repo_path, '*.py'), recursive=False)
+            for py_file in root_py_files:
+                if self._should_exclude_path(py_file):
+                    continue
+                try:
+                    with open(py_file, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                        if 'from flask import' in content or 'import flask' in content or 'Flask(' in content:
+                            flask_detected = True
+                            framework_hints['flask'] = 50
+                            examples.append(os.path.relpath(py_file, repo_path))
+                            break
+                except Exception:
+                    continue
+        
+        # Check for Angular patterns (filter out cloned_repos)
+        angular_components = [f for f in glob.glob(os.path.join(repo_path, '**/*.component.ts'), recursive=True) 
+                             if not self._should_exclude_path(f)]
+        angular_modules = [f for f in glob.glob(os.path.join(repo_path, '**/*.module.ts'), recursive=True) 
+                          if not self._should_exclude_path(f)]
+        angular_app_dir = os.path.exists(os.path.join(repo_path, 'src', 'app'))
+        
+        if angular_components or angular_modules or angular_app_dir:
+            framework_hints['angular'] = len(angular_components) + len(angular_modules)
+            if angular_components:
+                examples.extend([os.path.relpath(f, repo_path) for f in angular_components[:3]])
+        
+        # Check for React patterns (filter out cloned_repos)
+        react_components = [f for f in glob.glob(os.path.join(repo_path, '**/*.tsx'), recursive=True) 
+                           if not self._should_exclude_path(f)]
+        react_jsx = [f for f in glob.glob(os.path.join(repo_path, '**/*.jsx'), recursive=True) 
+                    if not self._should_exclude_path(f)]
+        react_components_dir = os.path.exists(os.path.join(repo_path, 'src', 'components'))
+        
+        if react_components or react_jsx or react_components_dir:
+            framework_hints['react'] = len(react_components) + len(react_jsx)
+            if react_components:
+                examples.extend([os.path.relpath(f, repo_path) for f in react_components[:3]])
+        
+        # Determine primary framework from hints (prioritize Flask if detected)
+        detected_framework = None
+        if framework_hints:
+            # Flask gets highest priority if detected
+            if 'flask' in framework_hints:
+                detected_framework = 'flask'
+            else:
+                detected_framework = max(framework_hints.items(), key=lambda x: x[1])[0]
+        
+        return {
+            'framework': detected_framework,
+            'file_patterns': file_patterns,
+            'examples': examples,
+            'hints': framework_hints
+        }
+    
     def _call_llm(
         self,
         intent: Dict[str, Any],
@@ -101,6 +205,19 @@ class Planner:
         
         # Extract PKG context if available
         pkg_context = ""
+        framework_type = 'unknown'  # Initialize framework_type
+        
+        # Analyze actual project structure as fallback
+        repo_path = None
+        if pkg_data and pkg_data.get('project', {}).get('rootPath'):
+            repo_path = pkg_data['project']['rootPath']
+        
+        structure_analysis = self._analyze_project_structure(repo_path, pkg_data)
+        structure_framework = structure_analysis.get('framework')
+        structure_examples = structure_analysis.get('examples', [])
+        
+        logger.info(f"📁 PROJECT STRUCTURE ANALYSIS | Framework: {structure_framework} | Examples: {len(structure_examples)} files")
+        
         if pkg_data:
             try:
                 from services.pkg_query_engine import PKGQueryEngine
@@ -111,7 +228,16 @@ class Planner:
                 
                 # Extract framework patterns from project
                 project = pkg_data.get('project', {})
-                framework_type = project.get('framework', 'unknown')
+                frameworks = project.get('frameworks', [])
+                primary_framework = frameworks[0] if frameworks else None
+                framework_type = primary_framework if primary_framework else 'unknown'
+                logger.info(f"🔍 FRAMEWORK DETECTION | Detected frameworks: {frameworks} | Primary: {framework_type}")
+                
+                # Use structure analysis if PKG frameworks are empty or unknown
+                if (not frameworks or framework_type == 'unknown') and structure_framework:
+                    framework_type = structure_framework
+                    logger.info(f"🔍 FRAMEWORK FROM STRUCTURE | Detected: {framework_type} | Examples: {structure_examples[:2]}")
+                
                 languages = project.get('languages', [])
                 
                 # Get framework patterns from impacted modules
@@ -124,7 +250,8 @@ class Planner:
                     if module_id:
                         try:
                             patterns = context_analyzer.extract_code_patterns(module_id)
-                            if patterns.get('framework_type'):
+                            # Only override framework_type if it's still unknown
+                            if framework_type == 'unknown' and patterns.get('framework_type'):
                                 framework_type = patterns.get('framework_type')
                             if patterns.get('patterns'):
                                 framework_patterns.extend(patterns.get('patterns', [])[:3])
@@ -137,8 +264,7 @@ class Planner:
                 
                 # Build PKG context string
                 pkg_context_parts = []
-                if framework_type and framework_type != 'unknown':
-                    pkg_context_parts.append(f"Framework: {framework_type}")
+                # Don't repeat framework here since it's at the top of the prompt
                 if languages:
                     pkg_context_parts.append(f"Languages: {', '.join(languages)}")
                 if framework_patterns:
@@ -159,7 +285,18 @@ class Planner:
                 logger.warning(f"Failed to extract PKG context for planning: {e}", exc_info=True)
                 # Continue without PKG context if extraction fails
         
-        prompt = f"""You are a code-change planner. Given the following information, produce a detailed, step-by-step plan for implementing the requested changes.
+        # Add structure examples to context
+        if structure_examples:
+            pkg_context += f"\n\nExisting Project Files (follow these patterns):\n"
+            for example in structure_examples[:5]:
+                pkg_context += f"- {example}\n"
+        
+        # Build framework-specific instruction
+        framework_instruction = ""
+        if framework_type and framework_type != 'unknown':
+            framework_instruction = self._build_framework_instruction(framework_type)
+        
+        prompt = f"""{framework_instruction}You are a code-change planner. Given the following information, produce a detailed, step-by-step plan for implementing the requested changes.
 
 Intent: {intent.get('description', '')}
 Intent Type: {intent.get('intent', 'unknown')}
@@ -191,20 +328,9 @@ For each task, provide:
 - estimated_time: Rough time estimate (e.g., "15min", "1h")
 
 Return a JSON object with this structure:
-{{
-  "tasks": [
-    {{
-      "task": "Description of task",
-      "files": ["path/to/file1.py", "path/to/file2.ts"],
-      "changes": ["Add field X to class Y", "Update method Z to handle new case"],
-      "tests": ["tests/test_file1.py - test_new_functionality"],
-      "notes": "Migration required: add column to database",
-      "estimated_time": "30min"
-    }}
-  ],
-  "total_estimated_time": "2h",
-  "migration_required": false
-}}
+{self._get_example_json(framework_type)}
+
+IMPORTANT: Follow the framework-specific file naming and extensions shown in the example above.
 
 Be specific, actionable, and consider the constraints. Order tasks logically (dependencies first)."""
 
@@ -228,6 +354,30 @@ Be specific, actionable, and consider the constraints. Order tasks logically (de
             # Normalize plan
             plan_dict = self._normalize_plan(plan_dict, intent, impact_result)
             
+            # Validate and correct file extensions based on framework
+            # Use structure_framework as fallback for validation
+            validation_framework = framework_type if framework_type != 'unknown' else structure_framework
+            if validation_framework and validation_framework.lower() == 'angular':
+                for task in plan_dict.get('tasks', []):
+                    corrected_files = []
+                    for file_path in task.get('files', []):
+                        # Replace .tsx with .ts for Angular
+                        if file_path.endswith('.tsx'):
+                            corrected = file_path.replace('.tsx', '.ts')
+                            logger.warning(f"⚠️  CORRECTED FILE EXTENSION | {file_path} -> {corrected} (Angular requires .ts, not .tsx)")
+                            corrected_files.append(corrected)
+                        else:
+                            corrected_files.append(file_path)
+                    task['files'] = corrected_files
+            elif validation_framework and validation_framework.lower() == 'react':
+                # For React, we could validate .tsx usage, but React can also use .ts for non-component files
+                # So we'll just log if we see .ts files that might be components
+                for task in plan_dict.get('tasks', []):
+                    for file_path in task.get('files', []):
+                        # Warn if React component might be using .ts instead of .tsx
+                        if file_path.endswith('.ts') and any(keyword in file_path.lower() for keyword in ['component', 'page', 'view']):
+                            logger.debug(f"React component using .ts extension: {file_path} (consider .tsx for components)")
+            
             return plan_dict
         
         except Exception as e:
@@ -245,6 +395,123 @@ Be specific, actionable, and consider the constraints. Order tasks logically (de
             if summary:
                 lines.append(f"   Summary: {summary[:100]}")
         return '\n'.join(lines) if lines else "No modules found"
+    
+    def _build_framework_instruction(self, framework_type: str) -> str:
+        """
+        Build framework-specific instruction string with file naming rules.
+        
+        Args:
+            framework_type: Framework name (e.g., 'angular', 'react')
+            
+        Returns:
+            Framework instruction string
+        """
+        framework_lower = framework_type.lower()
+        
+        if framework_lower == 'angular':
+            return """
+CRITICAL FRAMEWORK REQUIREMENT: This is an ANGULAR project. You MUST:
+- Use .ts file extensions for components (NOT .tsx)
+- Use Angular component syntax: @Component decorator
+- Use Angular imports: @angular/core, @angular/common, etc.
+- Follow Angular file structure: component.ts, component.html, component.css
+- Use Angular naming: login.component.ts (NOT Login.tsx)
+- File paths should be: src/components/login/login.component.ts
+- Separate files for template (.html) and styles (.css)
+
+REMEMBER: Use .ts for Angular components, NOT .tsx. Example: login.component.ts is correct, Login.tsx is WRONG for Angular.
+
+"""
+        elif framework_lower == 'react':
+            return """
+CRITICAL FRAMEWORK REQUIREMENT: This is a REACT project. You MUST:
+- Use .tsx file extensions for components (NOT .ts)
+- Use React component syntax: function components or class components
+- Use React imports: import React from 'react'
+- File paths should be: src/components/Login.tsx
+- Use PascalCase for component file names: Login.tsx, UserProfile.tsx
+
+"""
+        elif framework_lower == 'vue':
+            return """
+CRITICAL FRAMEWORK REQUIREMENT: This is a VUE project. You MUST:
+- Use .vue file extensions for components
+- Use Vue component syntax: <template>, <script>, <style>
+- Use Vue imports: import { defineComponent } from 'vue'
+- File paths should be: src/components/Login.vue
+
+"""
+        elif framework_lower == 'nestjs':
+            return """
+CRITICAL FRAMEWORK REQUIREMENT: This is a NESTJS project. You MUST:
+- Use .ts file extensions (NOT .tsx)
+- Use NestJS decorators: @Controller, @Injectable, @Module
+- Use NestJS imports: @nestjs/common, @nestjs/core
+- Follow NestJS file structure: *.controller.ts, *.service.ts, *.module.ts
+
+"""
+        elif framework_lower == 'flask':
+            return """
+CRITICAL FRAMEWORK REQUIREMENT: This is a FLASK project. You MUST:
+- Use .py file extensions
+- Use Flask route decorators: @app.route()
+- Use Flask imports: from flask import Flask, request, jsonify
+- Follow Flask file structure: routes/, services/, models/
+- Use Flask Blueprint for route organization: from flask import Blueprint
+- Use Flask request/response patterns: request.json, jsonify()
+
+REMEMBER: Use Python/Flask syntax, NOT Angular/React. Example: routes/auth.py is correct, not auth.component.ts.
+
+"""
+        else:
+            # Generic framework instruction
+            return f"""
+CRITICAL FRAMEWORK REQUIREMENT: This is a {framework_type.upper()} project.
+You MUST use {framework_type} syntax, patterns, and conventions.
+Follow the framework's standard file structure and naming conventions.
+
+"""
+    
+    def _get_example_json(self, framework_type: str) -> str:
+        """
+        Get framework-specific JSON example for prompt.
+        
+        Args:
+            framework_type: Framework name (e.g., 'angular', 'react')
+            
+        Returns:
+            JSON example string with framework-appropriate file paths
+        """
+        framework_lower = framework_type.lower() if framework_type else 'unknown'
+        
+        if framework_lower == 'angular':
+            example_files = '["src/components/login/login.component.ts", "src/components/login/login.component.html"]'
+        elif framework_lower == 'react':
+            example_files = '["src/components/Login.tsx", "src/components/UserProfile.tsx"]'
+        elif framework_lower == 'vue':
+            example_files = '["src/components/Login.vue", "src/components/UserProfile.vue"]'
+        elif framework_lower == 'nestjs':
+            example_files = '["src/auth/auth.controller.ts", "src/auth/auth.service.ts"]'
+        elif framework_lower == 'flask':
+            example_files = '["routes/auth.py", "services/auth_service.py", "app.py"]'
+        else:
+            # Generic example
+            example_files = '["path/to/file1.py", "path/to/file2.ts"]'
+        
+        return f"""{{
+  "tasks": [
+    {{
+      "task": "Description of task",
+      "files": {example_files},
+      "changes": ["Add field X to class Y", "Update method Z to handle new case"],
+      "tests": ["tests/test_file1.py - test_new_functionality"],
+      "notes": "Migration required: add column to database",
+      "estimated_time": "30min"
+    }}
+  ],
+  "total_estimated_time": "2h",
+  "migration_required": false
+}}"""
     
     def _parse_plan_from_text(self, text: str) -> Dict[str, Any]:
         """Fallback parser for plan text."""

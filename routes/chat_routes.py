@@ -263,6 +263,90 @@ def register_chat_events(socketio):
             })
     
     
+    @socketio.on('approval_response')
+    def handle_approval_response(data: Dict[str, Any]):
+        """
+        Handle approval response from user.
+        
+        Expected payload:
+        {
+            "session_id": "session-uuid",
+            "plan_id": "plan-uuid" (optional),
+            "approved": true/false
+        }
+        """
+        try:
+            session_id = data.get('session_id')
+            plan_id = data.get('plan_id')
+            approved = data.get('approved')
+            
+            if not session_id:
+                emit('error', {
+                    'type': 'validation_error',
+                    'message': 'session_id is required',
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                return
+            
+            if approved is None:
+                emit('error', {
+                    'type': 'validation_error',
+                    'message': 'approved field is required',
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                return
+            
+            logger.info(f"Approval response received - Session: {session_id}, Plan: {plan_id}, Approved: {approved}")
+            
+            if approved:
+                # Route to approval handler
+                emit('agent_update', {
+                    'type': 'status',
+                    'data': {
+                        'message': 'Plan approved, proceeding with execution...',
+                        'plan_id': plan_id
+                    },
+                    'session_id': session_id,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                
+                # Integrate with agent orchestrator to proceed with plan execution
+                try:
+                    from services.agent_orchestrator import AgentOrchestrator
+                    orchestrator = AgentOrchestrator()
+                    orchestrator.approve_plan(session_id, plan_id, socketio, request.sid)
+                except Exception as e:
+                    logger.error(f"Error approving plan: {e}", exc_info=True)
+                    emit('error', {
+                        'type': 'processing_error',
+                        'message': f'Failed to approve plan: {str(e)}',
+                        'timestamp': datetime.utcnow().isoformat()
+                    })
+            else:
+                # Handle rejection
+                reason = data.get('reason', 'No reason provided')
+                logger.info(f"Plan rejection received - Session: {session_id}, Plan: {plan_id}, Reason: {reason}")
+                
+                emit('agent_update', {
+                    'type': 'status',
+                    'data': {
+                        'message': 'Plan rejected. Please provide new instructions.',
+                        'plan_id': plan_id,
+                        'reason': reason
+                    },
+                    'session_id': session_id,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+            
+        except Exception as e:
+            logger.error(f"Error handling approval response: {e}", exc_info=True)
+            emit('error', {
+                'type': 'processing_error',
+                'message': f'Failed to process approval response: {str(e)}',
+                'timestamp': datetime.utcnow().isoformat()
+            })
+    
+    
     @socketio.on('reject_plan')
     def handle_reject_plan(data: Dict[str, Any]):
         """

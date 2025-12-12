@@ -88,12 +88,42 @@ class CodeEditExecutor:
                     full_path = os.path.join(self.repo_path, file_path)
                     
                     if not os.path.exists(full_path):
-                        logger.warning(f"File not found: {full_path}")
-                        errors.append({
-                            "file": file_path,
-                            "error": "File not found",
-                            "task_id": task_id
-                        })
+                        # Check if file should be created
+                        if self._should_create_file(change_descriptions, task):
+                            logger.info(f"File not found, creating new file: {full_path}")
+                            # Create new file
+                            edit_result = self._create_file(full_path, change_descriptions, task, pkg_data)
+                            
+                            if edit_result['success']:
+                                changes.append({
+                                    "file": file_path,
+                                    "status": "created",
+                                    "diff": edit_result.get('diff', ''),
+                                    "task_id": task_id
+                                })
+                                
+                                # Collect validation result
+                                if edit_result.get('validation'):
+                                    validation_results.append({
+                                        "file": file_path,
+                                        "validation": edit_result['validation'],
+                                        "task_id": task_id
+                                    })
+                            else:
+                                errors.append({
+                                    "file": file_path,
+                                    "error": edit_result.get('error', 'Failed to create file'),
+                                    "task_id": task_id,
+                                    "validation": edit_result.get('validation')
+                                })
+                        else:
+                            # File should exist but doesn't - log error
+                            logger.warning(f"File not found: {full_path}")
+                            errors.append({
+                                "file": file_path,
+                                "error": "File not found",
+                                "task_id": task_id
+                            })
                         continue
                     
                     # Apply edits with PKG context
@@ -137,6 +167,138 @@ class CodeEditExecutor:
             "total_files": len(changes),
             "success": len(errors) == 0
         }
+    
+    def _should_create_file(
+        self,
+        change_descriptions: List[str],
+        task: Dict[str, Any]
+    ) -> bool:
+        """
+        Determine if a file should be created based on change descriptions and task context.
+        
+        Args:
+            change_descriptions: List of change descriptions
+            task: Task dictionary
+            
+        Returns:
+            True if file should be created, False otherwise
+        """
+        # Check change descriptions for creation keywords
+        creation_keywords = ['create', 'new', 'add new file', 'generate', 'implement new', 
+                            'add new', 'new file', 'create new', 'implement']
+        
+        changes_text = ' '.join(change_descriptions).lower()
+        for keyword in creation_keywords:
+            if keyword in changes_text:
+                return True
+        
+        # Check task description for creation keywords
+        task_text = task.get('task', '').lower()
+        for keyword in creation_keywords:
+            if keyword in task_text:
+                return True
+        
+        # Check notes field
+        notes = task.get('notes', '').lower()
+        for keyword in creation_keywords:
+            if keyword in notes:
+                return True
+        
+        return False
+    
+    def _create_file(
+        self,
+        file_path: str,
+        change_descriptions: List[str],
+        task: Dict[str, Any],
+        pkg_data: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Create a new file with generated content.
+        
+        Args:
+            file_path: Full path to file
+            change_descriptions: List of change descriptions
+            task: Task dictionary
+            pkg_data: Optional PKG data dictionary for context-aware generation
+            
+        Returns:
+            Dictionary with success status, diff, and validation results
+        """
+        try:
+            # Create parent directories if needed
+            parent_dir = os.path.dirname(file_path)
+            if parent_dir and not os.path.exists(parent_dir):
+                os.makedirs(parent_dir, exist_ok=True)
+                logger.info(f"Created parent directory: {parent_dir}")
+            
+            # Generate file content using LLM
+            generated_content = self._generate_file_content(
+                file_path,
+                change_descriptions,
+                task,
+                pkg_data
+            )
+            
+            if not generated_content:
+                return {
+                    "success": False,
+                    "error": "Failed to generate file content",
+                    "diff": "",
+                    "status": "created"
+                }
+            
+            # Write the file
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(generated_content)
+            
+            logger.info(f"Created new file: {file_path}")
+            
+            # Generate diff (treat empty string as original)
+            diff = self._generate_file_diff("", generated_content, file_path)
+            
+            # Validate the created file
+            validation_result = None
+            try:
+                from agents.code_validator import CodeValidator
+                validator = CodeValidator(self.repo_path)
+                validation_result = validator.validate_all(file_path, generated_content, pkg_data)
+                
+                if not validation_result['valid']:
+                    logger.warning(f"Validation failed for created file {file_path}: {validation_result.get('errors', [])}")
+                    # Don't fail on validation errors for new files, but log them
+                
+                # Log warnings if any
+                if validation_result.get('warnings'):
+                    logger.warning(f"Code validation warnings for {file_path}: {validation_result['warnings']}")
+            except Exception as e:
+                logger.warning(f"Code validation error for created file: {e}", exc_info=True)
+                # Continue even if validation fails (non-blocking)
+                validation_result = {
+                    "valid": True,  # Don't block on validation errors
+                    "errors": [],
+                    "warnings": [f"Validation check failed: {str(e)}"]
+                }
+            
+            return {
+                "success": True,
+                "diff": diff,
+                "status": "created",
+                "validation": validation_result or {
+                    "valid": True,
+                    "errors": [],
+                    "warnings": []
+                }
+            }
+        
+        except Exception as e:
+            logger.error(f"Error creating file: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": str(e),
+                "diff": "",
+                "status": "created"
+            }
     
     def _edit_file(
         self,
@@ -359,6 +521,50 @@ class CodeEditExecutor:
                     logger.warning(f"Failed to build PKG context: {e}", exc_info=True)
                     # Continue without context if there's an error
             
+            # Extract frameworks from pkg_data
+            frameworks = pkg_data.get('project', {}).get('frameworks', []) if pkg_data else []
+            primary_framework = frameworks[0] if frameworks else None
+            
+            # Log framework detection for debugging
+            if primary_framework:
+                logger.info(f"🔍 CODE EDITOR | Detected framework: {primary_framework} | All frameworks: {frameworks}")
+            
+            # Build framework instruction string
+            framework_instruction = ""
+            if primary_framework:
+                framework_lower = primary_framework.lower()
+                if framework_lower == 'flask':
+                    framework_instruction = """
+CRITICAL FRAMEWORK REQUIREMENT: This is a FLASK project. You MUST:
+- Use .py file extensions
+- Use Flask route decorators: @app.route()
+- Use Flask imports: from flask import Flask, request, jsonify
+- Follow Flask file structure: routes/, services/, models/
+- Use Flask Blueprint for route organization: from flask import Blueprint
+- Use Flask request/response patterns: request.json, jsonify()
+
+REMEMBER: Use Python/Flask syntax, NOT Angular/React. Example: routes/auth.py is correct, not auth.component.ts.
+
+"""
+                elif framework_lower == 'angular':
+                    framework_instruction = """
+CRITICAL FRAMEWORK REQUIREMENT: This is an ANGULAR project. You MUST:
+- Use .ts file extensions for components (NOT .tsx)
+- Use Angular component syntax: @Component decorator
+- Use Angular imports: @angular/core, @angular/common, etc.
+- Follow Angular file structure: component.ts, component.html, component.css
+
+"""
+                else:
+                    framework_instruction = f"""
+CRITICAL FRAMEWORK REQUIREMENT: This is a {primary_framework.upper()} project.
+You MUST use {primary_framework} syntax, patterns, and conventions.
+- Use {primary_framework} component syntax (e.g., @Component for Angular, not React JSX)
+- Use {primary_framework} imports (e.g., @angular/core for Angular, not react)
+- Follow {primary_framework} file structure and naming conventions
+
+"""
+            
             changes_text = '\n'.join(f"- {desc}" for desc in change_descriptions)
             
             prompt = f"""You are a code-edit assistant. Given:
@@ -369,7 +575,7 @@ class CodeEditExecutor:
 >>>
 - Edit instructions:
 {changes_text}
-{context_info}
+{framework_instruction}{context_info}
 Apply the edits precisely. Return ONLY the modified file content (no prose, no explanations).
 Preserve code style and formatting. Make minimal, targeted changes.
 {f"Follow the framework patterns and conventions shown in related modules." if context_info else ""}"""
@@ -392,6 +598,212 @@ Preserve code style and formatting. Make minimal, targeted changes.
         except Exception as e:
             logger.error(f"LLM edit failed: {e}", exc_info=True)
             return original_content
+    
+    def _generate_file_content(
+        self,
+        file_path: str,
+        change_descriptions: List[str],
+        task: Dict[str, Any],
+        pkg_data: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """
+        Generate complete file content using LLM with rich PKG context.
+        
+        Args:
+            file_path: File path
+            change_descriptions: List of change descriptions
+            task: Task dictionary
+            pkg_data: Optional PKG data dictionary for context-aware generation
+            
+        Returns:
+            Generated file content
+        """
+        try:
+            from langchain_openai import ChatOpenAI
+            import os
+            
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                logger.warning("OPENAI_API_KEY not set, cannot generate file content")
+                return ""
+            
+            llm = ChatOpenAI(
+                model=os.getenv("LLM_MODEL", "gpt-4"),
+                temperature=0.1,
+                openai_api_key=api_key
+            )
+            
+            # Build rich context from PKG if available
+            context_info = ""
+            if pkg_data:
+                try:
+                    from agents.code_context_analyzer import CodeContextAnalyzer
+                    from services.pkg_query_engine import PKGQueryEngine
+                    
+                    query_engine = PKGQueryEngine(pkg_data)
+                    context_analyzer = CodeContextAnalyzer(pkg_data, query_engine)
+                    
+                    # Convert file_path to relative path from repo root
+                    rel_path = os.path.relpath(file_path, self.repo_path) if os.path.isabs(file_path) else file_path
+                    rel_path_normalized = rel_path.replace('\\', '/')
+                    
+                    # Try to find related modules by directory or similar patterns
+                    # For new files, we look for modules in the same directory or similar patterns
+                    parent_dir = os.path.dirname(rel_path_normalized)
+                    related_modules = []
+                    
+                    # Find modules in the same directory or parent directories
+                    for mod in pkg_data.get('modules', []):
+                        mod_path = mod.get('path', '').replace('\\', '/')
+                        mod_parent = os.path.dirname(mod_path)
+                        if parent_dir in mod_parent or mod_parent in parent_dir:
+                            related_modules.append(mod)
+                            if len(related_modules) >= 3:
+                                break
+                    
+                    # If no related modules found by path, try to find by framework patterns
+                    if not related_modules:
+                        # Look for modules with similar file extensions or naming patterns
+                        file_ext = os.path.splitext(rel_path)[1]
+                        for mod in pkg_data.get('modules', []):
+                            mod_path = mod.get('path', '')
+                            if os.path.splitext(mod_path)[1] == file_ext:
+                                related_modules.append(mod)
+                                if len(related_modules) >= 3:
+                                    break
+                    
+                    # Build context from related modules
+                    if related_modules:
+                        # Use the first related module to build context
+                        module = related_modules[0]
+                        module_id = module.get('id')
+                        if module_id:
+                            intent = task.get('intent', {})
+                            try:
+                                context = context_analyzer.build_code_generation_context(module_id, intent)
+                            except Exception as e:
+                                logger.warning(f"Failed to build code generation context: {e}", exc_info=True)
+                                context = {}
+                            
+                            # Build context string for prompt
+                            context_parts = []
+                            
+                            if context.get('framework'):
+                                context_parts.append(f"- Framework: {context['framework']}")
+                            
+                            if context.get('patterns', {}).get('patterns'):
+                                patterns_str = ', '.join(context['patterns']['patterns'][:5])
+                                context_parts.append(f"- Code patterns: {patterns_str}")
+                            
+                            if related_modules:
+                                related_paths = [m.get('path', '') for m in related_modules[:3]]
+                                if related_paths:
+                                    context_parts.append(f"- Related modules: {', '.join(related_paths)}")
+                            
+                            if context.get('import_patterns', {}).get('direct_imports'):
+                                imports_str = ', '.join(context['import_patterns']['direct_imports'][:5])
+                                context_parts.append(f"- Import patterns: {imports_str}")
+                            
+                            if context.get('code_style', {}).get('naming_convention'):
+                                context_parts.append(f"- Naming convention: {context['code_style']['naming_convention']}")
+                            
+                            if context.get('type_information'):
+                                type_info_str = ', '.join([
+                                    f"{name}: {info.get('signature', '')}" 
+                                    for name, info in list(context['type_information'].items())[:3]
+                                ])
+                                if type_info_str:
+                                    context_parts.append(f"- Type information: {type_info_str}")
+                            
+                            if context_parts:
+                                context_info = "\n".join(context_parts) + "\n"
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to build PKG context for file creation: {e}", exc_info=True)
+                    # Continue without context if there's an error
+            
+            # Extract frameworks from pkg_data
+            frameworks = pkg_data.get('project', {}).get('frameworks', []) if pkg_data else []
+            primary_framework = frameworks[0] if frameworks else None
+            
+            # Log framework detection for debugging
+            if primary_framework:
+                logger.info(f"🔍 CODE EDITOR FILE GENERATION | Detected framework: {primary_framework} | All frameworks: {frameworks}")
+            
+            # Build framework instruction string
+            framework_instruction = ""
+            if primary_framework:
+                framework_lower = primary_framework.lower()
+                if framework_lower == 'flask':
+                    framework_instruction = """
+CRITICAL FRAMEWORK REQUIREMENT: This is a FLASK project. You MUST:
+- Use .py file extensions
+- Use Flask route decorators: @app.route()
+- Use Flask imports: from flask import Flask, request, jsonify
+- Follow Flask file structure: routes/, services/, models/
+- Use Flask Blueprint for route organization: from flask import Blueprint
+- Use Flask request/response patterns: request.json, jsonify()
+
+REMEMBER: Use Python/Flask syntax, NOT Angular/React. Example: routes/auth.py is correct, not auth.component.ts.
+
+"""
+                elif framework_lower == 'angular':
+                    framework_instruction = """
+CRITICAL FRAMEWORK REQUIREMENT: This is an ANGULAR project. You MUST:
+- Use .ts file extensions for components (NOT .tsx)
+- Use Angular component syntax: @Component decorator
+- Use Angular imports: @angular/core, @angular/common, etc.
+- Follow Angular file structure: component.ts, component.html, component.css
+
+"""
+                else:
+                    framework_instruction = f"""
+CRITICAL FRAMEWORK REQUIREMENT: This is a {primary_framework.upper()} project.
+You MUST use {primary_framework} syntax, patterns, and conventions.
+- Use {primary_framework} component syntax (e.g., @Component for Angular, not React JSX)
+- Use {primary_framework} imports (e.g., @angular/core for Angular, not react)
+- Follow {primary_framework} file structure and naming conventions
+
+"""
+            
+            changes_text = '\n'.join(f"- {desc}" for desc in change_descriptions)
+            task_description = task.get('task', '')
+            
+            prompt = f"""You are a code generation assistant. Generate a complete, production-ready file.
+
+File path: {file_path}
+Task: {task_description}
+Requirements:
+{changes_text}
+
+{framework_instruction}{context_info}
+Generate the complete file content following:
+- Framework patterns and conventions from related modules
+- Import patterns and code style from the codebase
+- Best practices for the file type
+- All necessary imports, exports, and structure
+
+Return ONLY the complete file content (no prose, no explanations, no markdown code blocks).
+The file should be ready to use and follow the same patterns as related modules in the codebase."""
+
+            response = llm.invoke(prompt)
+            generated_content = response.content if hasattr(response, 'content') else str(response)
+            
+            # Clean up response (remove markdown code blocks if present)
+            if generated_content.startswith('```'):
+                # Remove code block markers
+                lines = generated_content.split('\n')
+                if lines[0].startswith('```'):
+                    lines = lines[1:]
+                if lines and lines[-1].strip() == '```':
+                    lines = lines[:-1]
+                generated_content = '\n'.join(lines)
+            
+            return generated_content.strip()
+        
+        except Exception as e:
+            logger.error(f"LLM file generation failed: {e}", exc_info=True)
+            return ""
     
     def _generate_file_diff(
         self,

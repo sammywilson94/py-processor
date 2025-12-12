@@ -428,6 +428,7 @@ class PKGGenerator:
                 "name": project_meta.get("name", ""),
                 "rootPath": project_meta.get("rootPath", ""),
                 "languages": project_meta.get("languages", []),
+                "frameworks": project_meta.get("frameworks", []),
                 "metadata": project_meta.get("metadata", {})
             },
             "modules": self.modules,

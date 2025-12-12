@@ -2,9 +2,11 @@
 
 import logging
 import os
+import platform
+import shutil
 import subprocess
 import re
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,30 @@ class TestRunner:
             self.language = 'csharp'
         else:
             self.language = 'unknown'
+    
+    def _get_node_command(self, command: str) -> List[str]:
+        """
+        Get the correct Node.js command for the current platform.
+        
+        On Windows, npm and npx are batch files (.cmd), so we need to use
+        'npm.cmd' or 'npx.cmd' instead of 'npm' or 'npx'.
+        
+        Args:
+            command: The command name ('npm' or 'npx')
+            
+        Returns:
+            List containing the command to use (e.g., ['npm.cmd'] on Windows, ['npm'] otherwise)
+        """
+        if platform.system() == 'Windows':
+            cmd = f'{command}.cmd'
+            # Optionally validate command exists
+            if shutil.which(cmd) is None:
+                # Fallback to command without .cmd if .cmd version not found
+                if shutil.which(command) is not None:
+                    return [command]
+            return [cmd]
+        else:
+            return [command]
     
     def run_tests(self, language: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -145,7 +171,7 @@ class TestRunner:
             
             # Try npm test
             result = subprocess.run(
-                ['npm', 'test'],
+                self._get_node_command('npm') + ['test'],
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -394,7 +420,7 @@ class TestRunner:
         """Run eslint for TypeScript/JavaScript."""
         try:
             result = subprocess.run(
-                ['npx', 'eslint', '.'],
+                self._get_node_command('npx') + ['eslint', '.'],
                 capture_output=True,
                 text=True,
                 timeout=60,
@@ -475,7 +501,7 @@ class TestRunner:
         """Run TypeScript compiler for type checking."""
         try:
             result = subprocess.run(
-                ['npx', 'tsc', '--noEmit'],
+                self._get_node_command('npx') + ['tsc', '--noEmit'],
                 capture_output=True,
                 text=True,
                 timeout=60,
