@@ -1831,7 +1831,7 @@ Return ONLY the Mermaid code, no explanations or markdown formatting."""
         # Use base64 encoding for better reliability with complex diagrams
         mermaid_bytes = mermaid_code.encode('utf-8')
         mermaid_b64 = base64.urlsafe_b64encode(mermaid_bytes).decode('utf-8')
-        url = f"https://mermaid.ink/img/{mermaid_b64}"
+        url = f"https://mermaid.ink/svg/{mermaid_b64}"
         
         # Fetch the image
         with urllib.request.urlopen(url, timeout=15) as response:
