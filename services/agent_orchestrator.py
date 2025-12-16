@@ -188,6 +188,26 @@ class AgentOrchestrator:
             elif intent_category == 'code_change':
                 # Execute full workflow for code changes
                 logger.info(f"⚙️  HANDLING CODE CHANGE REQUEST | Session: {session_id}")
+                # Retrieve repo_url from session if not provided
+                if not repo_url and session_id in self.sessions:
+                    repo_url = self.sessions[session_id].get('repo_url')
+                
+                # If repo_path or pkg_data are missing but repo_url exists, load them
+                if (not repo_path or not pkg_data) and repo_url:
+                    # Try to load repo/PKG (will check session cache, Neo4j, file cache, or regenerate)
+                    loaded_repo_path, loaded_pkg_data = self._ensure_repo_loaded(
+                        session_id, repo_url, socketio, sid
+                    )
+                    if loaded_pkg_data:
+                        pkg_data = loaded_pkg_data
+                        self.sessions[session_id]['pkg_data'] = pkg_data
+                    if loaded_repo_path:
+                        repo_path = loaded_repo_path
+                        self.sessions[session_id]['repo_path'] = repo_path
+                
+                # // if repo path exists and pkg is not found, regenerate pkg
+                if repo_path and not pkg_data:
+                    pkg_data = self._load_pkg(repo_path)
                 if repo_path and pkg_data:
                     logger.info(f"🚀 EXECUTING WORKFLOW | Session: {session_id} | Repo: {repo_path}")
                     self._execute_workflow(
@@ -316,7 +336,27 @@ class AgentOrchestrator:
             # Check if already loaded in session cache (using potentially forked repo_url)
             if session.get('repo_url') == repo_url and session.get('pkg_data'):
                 logger.info(f"✅ USING CACHED PKG | Session: {session_id} | Repo: {repo_url}")
-                return session.get('repo_path'), session.get('pkg_data')
+                cached_pkg_data = session.get('pkg_data')
+                cached_repo_path = session.get('repo_path')
+                
+                # If repo_path is missing but PKG exists, derive it from PKG's rootPath or construct from repo_url
+                if not cached_repo_path and cached_pkg_data:
+                    root_path = cached_pkg_data.get('project', {}).get('rootPath')
+                    if root_path and os.path.exists(root_path):
+                        cached_repo_path = root_path
+                        self.sessions[session_id]['repo_path'] = cached_repo_path
+                        logger.info(f"📂 DERIVED REPO PATH FROM PKG | Session: {session_id} | Path: {cached_repo_path}")
+                    else:
+                        # Fallback: construct from repo_url
+                        repo_name = os.path.splitext(os.path.basename(repo_url))[0]
+                        base_dir = os.path.join(os.getcwd(), "cloned_repos")
+                        constructed_path = os.path.join(base_dir, repo_name)
+                        if os.path.exists(constructed_path):
+                            cached_repo_path = constructed_path
+                            self.sessions[session_id]['repo_path'] = cached_repo_path
+                            logger.info(f"📂 CONSTRUCTED REPO PATH | Session: {session_id} | Path: {cached_repo_path}")
+                
+                return cached_repo_path, cached_pkg_data
             
             # Extract project_id from repo_url (after fork, before cloning)
             # Use same logic as extract_project_metadata: repo_name from URL
