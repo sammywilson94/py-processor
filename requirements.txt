@@ -3,7 +3,8 @@ docling>=2.61.1
 python-dotenv>=1.0.0
 pytest>=7.4.0
 flask-cors>=4.0.0
-opencv-python-headless>=4.8.0
+opencv-python-headless<4.11.0
+numpy<2
 qdrant-client>=1.16.0
 langchain>=1.0.8
 langchain-core>=1.1.0

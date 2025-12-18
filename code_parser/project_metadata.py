@@ -441,6 +441,271 @@ def extract_python_version(repo_path: Path) -> Optional[str]:
     return None
 
 
+def extract_project_ui_patterns(modules: List[Dict[str, Any]], repo_path: str) -> Dict[str, Any]:
+    """
+    Extract project-level UI patterns by aggregating from all modules.
+    
+    Args:
+        modules: List of module dictionaries with uiElements
+        repo_path: Root path of the repository
+        
+    Returns:
+        Dictionary with aggregated UI patterns
+    """
+    from collections import Counter
+    from pathlib import Path
+    
+    ui_patterns: Dict[str, Any] = {
+        "buttonComponent": None,
+        "navigationPattern": None,
+        "routingConfig": None,
+        "commonImports": []
+    }
+    
+    navigation_patterns: Dict[str, Any] = {
+        "backButtonPatterns": []
+    }
+    
+    button_imports = Counter()
+    navigation_patterns_list = []
+    all_imports = Counter()
+    back_button_patterns = Counter()
+    
+    # Aggregate patterns from modules
+    for module in modules:
+        ui_elements = module.get("uiElements", {})
+        
+        # Collect button imports
+        buttons = ui_elements.get("buttons", [])
+        for button in buttons:
+            button_import = button.get("import")
+            if button_import:
+                button_imports[button_import] += 1
+        
+        # Collect navigation patterns
+        navigation = ui_elements.get("navigation", {})
+        if navigation:
+            nav_pattern = navigation.get("pattern")
+            if nav_pattern:
+                navigation_patterns_list.append(nav_pattern)
+        
+        # Collect imports from code patterns
+        code_patterns = module.get("codePatterns", {})
+        if code_patterns:
+            # This would need to be extracted from actual imports in the module
+            pass
+    
+    # Find most common button component
+    if button_imports:
+        ui_patterns["buttonComponent"] = button_imports.most_common(1)[0][0]
+    
+    # Find most common navigation pattern
+    if navigation_patterns_list:
+        nav_counter = Counter(navigation_patterns_list)
+        ui_patterns["navigationPattern"] = nav_counter.most_common(1)[0][0]
+    
+    # Find routing config file
+    repo_path_obj = Path(repo_path)
+    routing_files = [
+        "app-routing.module.ts",
+        "routing.module.ts",
+        "router.ts",
+        "routes.ts",
+        "AppRouter.tsx",
+        "router.js"
+    ]
+    
+    for routing_file in routing_files:
+        # Search in common locations
+        search_paths = [
+            repo_path_obj / routing_file,
+            repo_path_obj / "src" / routing_file,
+            repo_path_obj / "src" / "app" / routing_file,
+        ]
+        for search_path in search_paths:
+            if search_path.exists():
+                rel_path = os.path.relpath(search_path, repo_path)
+                ui_patterns["routingConfig"] = rel_path.replace(os.sep, '/')
+                break
+        if ui_patterns["routingConfig"]:
+            break
+    
+    # Extract top 10 most common imports from modules
+    # This would need actual import analysis - simplified here
+    # In practice, this would analyze all imports from all modules
+    
+    # Find back button patterns
+    # Search for common back button patterns in source files
+    back_patterns = [
+        r'router\.(back|go\(-1\))',
+        r'history\.(back|go\(-1\))',
+        r'navigate\(["\']\.\./',
+        r'routerLink\s*=\s*["\']\.\./'
+    ]
+    
+    source_dirs = ["src", "app", "components"]
+    for source_dir in source_dirs:
+        src_path = repo_path_obj / source_dir
+        if not src_path.exists():
+            continue
+        
+        for file_path in src_path.rglob("*.{ts,tsx,js,jsx,html}"):
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                    for pattern in back_patterns:
+                        matches = re.findall(pattern, content, re.IGNORECASE)
+                        if matches:
+                            back_button_patterns[pattern] += len(matches)
+            except Exception:
+                continue
+    
+    # Convert to list with frequency
+    for pattern, frequency in back_button_patterns.most_common(10):
+        navigation_patterns["backButtonPatterns"].append({
+            "pattern": pattern,
+            "frequency": frequency
+        })
+    
+    return {
+        "uiPatterns": ui_patterns,
+        "navigationPatterns": navigation_patterns
+    }
+
+
+def extract_code_style(repo_path: str, sample_size: int = 20) -> Dict[str, Any]:
+    """
+    Extract code style conventions from actual files.
+    
+    Analyzes naming conventions, quote style, indentation, semicolons, and import style.
+    
+    Args:
+        repo_path: Root path of the repository
+        sample_size: Number of files to sample for analysis
+        
+    Returns:
+        Dictionary with code style information
+    """
+    from pathlib import Path
+    from collections import Counter
+    
+    repo_path_obj = Path(repo_path)
+    code_style: Dict[str, Any] = {
+        "namingConvention": "camelCase",
+        "importStyle": "mixed",
+        "quoteStyle": "single",
+        "indentation": 2,
+        "semicolons": True
+    }
+    
+    # Collect sample files
+    sample_files = []
+    source_dirs = ["src", "app", "lib", "components"]
+    
+    for source_dir in source_dirs:
+        src_path = repo_path_obj / source_dir
+        if src_path.exists():
+            for ext in ["*.ts", "*.tsx", "*.js", "*.jsx", "*.py"]:
+                for file_path in src_path.rglob(ext):
+                    if len(sample_files) >= sample_size:
+                        break
+                    sample_files.append(file_path)
+                if len(sample_files) >= sample_size:
+                    break
+        if len(sample_files) >= sample_size:
+            break
+    
+    naming_patterns = Counter()
+    quote_styles = Counter()
+    indentations = Counter()
+    semicolon_usage = Counter()
+    import_styles = Counter()
+    
+    for file_path in sample_files:
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+                lines = content.split('\n')
+                
+                # Analyze naming conventions from variable/function names
+                # Look for camelCase, PascalCase, snake_case
+                camel_case_pattern = r'\b[a-z][a-zA-Z0-9]*\b'
+                pascal_case_pattern = r'\b[A-Z][a-zA-Z0-9]*\b'
+                snake_case_pattern = r'\b[a-z_][a-z0-9_]*\b'
+                
+                camel_matches = len(re.findall(camel_case_pattern, content))
+                pascal_matches = len(re.findall(pascal_case_pattern, content))
+                snake_matches = len(re.findall(snake_case_pattern, content))
+                
+                if camel_matches > pascal_matches and camel_matches > snake_matches:
+                    naming_patterns["camelCase"] += 1
+                elif pascal_matches > snake_matches:
+                    naming_patterns["PascalCase"] += 1
+                elif snake_matches > 0:
+                    naming_patterns["snake_case"] += 1
+                
+                # Analyze quote style
+                single_quotes = content.count("'")
+                double_quotes = content.count('"')
+                if single_quotes > double_quotes:
+                    quote_styles["single"] += 1
+                else:
+                    quote_styles["double"] += 1
+                
+                # Analyze indentation
+                for line in lines[:50]:  # Sample first 50 lines
+                    if line.strip():
+                        leading_spaces = len(line) - len(line.lstrip())
+                        if leading_spaces > 0:
+                            # Determine if tabs or spaces
+                            if line[0] == '\t':
+                                indentations["tab"] += 1
+                            else:
+                                indentations[leading_spaces] += 1
+                
+                # Analyze semicolons
+                if ';' in content:
+                    semicolon_usage[True] += 1
+                else:
+                    semicolon_usage[False] += 1
+                
+                # Analyze import style
+                relative_imports = len(re.findall(r"from\s+['\"](\.\.?/)", content))
+                absolute_imports = len(re.findall(r"from\s+['\"][^./]", content))
+                
+                if relative_imports > 0 and absolute_imports > 0:
+                    import_styles["mixed"] += 1
+                elif absolute_imports > 0:
+                    import_styles["absolute"] += 1
+                elif relative_imports > 0:
+                    import_styles["relative"] += 1
+                    
+        except Exception:
+            continue
+    
+    # Set most common values
+    if naming_patterns:
+        code_style["namingConvention"] = naming_patterns.most_common(1)[0][0]
+    
+    if quote_styles:
+        code_style["quoteStyle"] = quote_styles.most_common(1)[0][0]
+    
+    if indentations:
+        most_common_indent = indentations.most_common(1)[0]
+        if most_common_indent[0] == "tab":
+            code_style["indentation"] = 1  # Represent tabs as 1
+        else:
+            code_style["indentation"] = most_common_indent[0]
+    
+    if semicolon_usage:
+        code_style["semicolons"] = semicolon_usage.most_common(1)[0][0]
+    
+    if import_styles:
+        code_style["importStyle"] = import_styles.most_common(1)[0][0]
+    
+    return code_style
+
+
 def extract_project_metadata(repo_path: str) -> Dict[str, Any]:
     """
     Extract comprehensive project metadata.
