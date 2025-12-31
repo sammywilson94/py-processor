@@ -4,8 +4,7 @@ nixPkgs = ["python311", "gcc", "make"]
 [phases.install]
 cmds = [
   "pip install --upgrade pip",
-  "pip install -r requirements.txt",
-  "playwright install --with-deps chromium || echo 'Playwright install failed, continuing...'"
+  "pip install -r requirements.txt"
 ]
 
 [start]
