@@ -104,7 +104,7 @@ def create_app() -> Flask:
             # Support comma-separated list of origins
             cors_origins = [origin.strip() for origin in cors_origins_env.split(',')]
         
-        async_mode = config.websocket_async_mode
+        async_mode = "gevent"
         # Configure ping/pong settings to prevent premature timeouts
         ping_timeout = config.websocket_ping_timeout
         ping_interval = config.websocket_ping_interval
